@@ -6,32 +6,32 @@ import torch.nn.functional as F
 class SharedDNN(nn.Module):
     """
     Shared-weight DNN that maps a 64-dim frequency vector
-    to a 16-dim embedding.
+    to a d-dim embedding.
 
-    Architecture (from the paper):
-        Input  (64)  -> Hidden (128) -> Hidden (64) -> Hidden (32) -> Output (16)
+    Default architecture (from the paper):
+        Input  (64)  -> Hidden (128) -> Hidden (64) -> Hidden (32) -> Output (d)
 
+    hidden_dims can be passed to reproduce the paper's Figure 6 layer sweep.
     All three Siamese branches share the same instance of this network.
     """
 
-    def __init__(self, input_dim=64, embedding_dim=16):
+    def __init__(self, input_dim=64, embedding_dim=16, hidden_dims=None, dropout=0.3):
         super().__init__()
 
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+        if hidden_dims is None:
+            hidden_dims = [64, 32]
 
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
+        layers = []
+        prev_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_dim = h_dim
+        layers.append(nn.Linear(prev_dim, embedding_dim))
 
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-
-            nn.Linear(32, embedding_dim),
-        )
+        self.encoder = nn.Sequential(*layers)
 
     def forward(self, x):
         embedding = self.encoder(x)
@@ -69,9 +69,9 @@ class SiameseNetwork(nn.Module):
     The triplet loss is computed from these three embeddings.
     """
 
-    def __init__(self, input_dim=64, embedding_dim=16, margin=1.0):
+    def __init__(self, input_dim=64, embedding_dim=16, margin=1.0, hidden_dims=None, dropout=0.3):
         super().__init__()
-        self.shared_dnn = SharedDNN(input_dim, embedding_dim)
+        self.shared_dnn = SharedDNN(input_dim, embedding_dim, hidden_dims, dropout)
         self.triplet_loss = TripletLoss(margin)
 
     def forward(self, anchor, positive, negative):
