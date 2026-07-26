@@ -5,21 +5,19 @@ import torch.nn.functional as F
 
 class SharedDNN(nn.Module):
     """
-    Shared-weight DNN that maps a 64-dim frequency vector
+    Shared-weight DNN that maps a 40-dim feature vector
+    (30 CAN-ID one-hot + 1 other + 8 bytes + 1 DLC)
     to a d-dim embedding.
-
-    Default architecture (from the paper):
-        Input  (64)  -> Hidden (128) -> Hidden (64) -> Hidden (32) -> Output (d)
 
     hidden_dims can be passed to reproduce the paper's Figure 6 layer sweep.
     All three Siamese branches share the same instance of this network.
     """
 
-    def __init__(self, input_dim=64, embedding_dim=16, hidden_dims=None, dropout=0.3):
+    def __init__(self, input_dim=40, embedding_dim=16, hidden_dims=None, dropout=0.3):
         super().__init__()
 
         if hidden_dims is None:
-            hidden_dims = [64, 32]
+            hidden_dims = [16, 32]
 
         layers = []
         prev_dim = input_dim
@@ -69,7 +67,7 @@ class SiameseNetwork(nn.Module):
     The triplet loss is computed from these three embeddings.
     """
 
-    def __init__(self, input_dim=64, embedding_dim=16, margin=1.0, hidden_dims=None, dropout=0.3):
+    def __init__(self, input_dim=40, embedding_dim=16, margin=1.0, hidden_dims=None, dropout=0.3):
         super().__init__()
         self.shared_dnn = SharedDNN(input_dim, embedding_dim, hidden_dims, dropout)
         self.triplet_loss = TripletLoss(margin)

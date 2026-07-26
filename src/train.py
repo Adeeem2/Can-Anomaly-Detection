@@ -140,6 +140,18 @@ def prepare_data(val_ratio, test_ratio):
         nf, _, af, _ = splits[name]
         print(f"  {name:5s}: {len(nf):,} / {len(af):,}")
 
+    # Subsample training data for fast training
+    MAX_TRAIN = 150_000
+    nf, ni, af, ai = splits["train"]
+    if len(nf) > MAX_TRAIN:
+        idx = np.random.choice(len(nf), MAX_TRAIN, replace=False)
+        nf, ni = nf[idx], ni[idx]
+    if len(af) > MAX_TRAIN:
+        idx = np.random.choice(len(af), MAX_TRAIN, replace=False)
+        af, ai = af[idx], ai[idx]
+    splits["train"] = (nf, ni, af, ai)
+    print(f"Train subsampled to: {len(nf):,} / {len(af):,}")
+
     return splits
 
 
@@ -159,7 +171,7 @@ def compute_threshold(model, feats, ids, device, percentile=99):
     tensor = torch.tensor(feats, dtype=torch.float32).to(device)
     all_emb = []
     for i in range(0, len(tensor), 256):
-        all_emb.append(model(tensor[i:i + 256]).cpu().numpy())
+        all_emb.append(model.shared_dnn(tensor[i:i + 256]).cpu().numpy())
     emb = np.vstack(all_emb)
 
     ids = np.array(ids, dtype=str)
