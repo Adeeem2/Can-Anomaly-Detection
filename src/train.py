@@ -1,346 +1,294 @@
 import torch
 import numpy as np
 import pandas as pd
+import json
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from sklearn.model_selection import train_test_split
 
 from src.model import SiameseNetwork
-
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
 MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 MODEL_DIR.mkdir(exist_ok=True)
+
+TOP_K = 30
+META_COLS = {"CAN_ID", "Timestamp"}
+BYTE_COLS = [f"byte_{i}" for i in range(8)]
 
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
-# ──────────────────────────────────────────────
-#  Dataset
-# ──────────────────────────────────────────────
+# ── Fit / Transform ──────────────────────────
+
+def fit_top_ids(can_ids, k=TOP_K):
+    """Learn top-k CAN IDs from training normal data only."""
+    counts = pd.Series(can_ids).value_counts()
+    top = counts.head(k).index.tolist()
+    print(f"Top-{k} IDs: {top[:5]} ... ({len(top)} total)")
+    return top
+
+
+def build_features(can_ids, top_ids, byte_arr, dlc_arr):
+    """Build 40-dim feature matrix: [31 one-hot | 8 bytes | 1 dlc]."""
+    n = len(can_ids)
+    f = np.zeros((n, 40), dtype=np.float32)
+    id_map = {cid: i for i, cid in enumerate(top_ids)}
+    for i, cid in enumerate(can_ids):
+        f[i, id_map.get(cid, TOP_K)] = 1.0  # column TOP_K = "other"
+    f[:, TOP_K + 1 : TOP_K + 9] = byte_arr  # already /255 from features.py
+    f[:, TOP_K + 9] = dlc_arr                # already /8 from features.py
+    return f
+
+
+# ── Dataset ──────────────────────────────────
 
 class TripletDataset(Dataset):
-    """
-    Generates triplets on-the-fly:
-        anchor   = random sample from normal data
-        positive = another random sample from normal data (same CAN_ID preferred,
-                   per paper Section 4.1: comparisons are meaningful per-ID since
-                   normal behavior is ID-specific)
-        negative = random sample from attack data (same CAN_ID preferred, so the
-                   network learns to separate normal-vs-attack *within* an ID,
-                   rather than partly just learning to separate different IDs)
-    """
+    """On-the-fly triplet generation with same-ID preference."""
 
-    def __init__(self, normal_features, normal_ids, attack_features, attack_ids=None):
-        self.normal = torch.tensor(normal_features, dtype=torch.float32)
+    def __init__(self, normal_feats, normal_ids, attack_feats, attack_ids):
+        self.normal = torch.tensor(normal_feats, dtype=torch.float32)
+        self.attack = torch.tensor(attack_feats, dtype=torch.float32)
         self.normal_ids = normal_ids
-        self.attack = torch.tensor(attack_features, dtype=torch.float32)
-        self.attack_ids = attack_ids
+        self.id_to_normal = self._group(normal_ids)
+        self.id_to_attack = self._group(attack_ids)
 
-        # Build index: CAN_ID -> list of sample indices (normal)
-        self.id_to_normal_indices = {}
-        for i, cid in enumerate(normal_ids):
-            self.id_to_normal_indices.setdefault(cid, []).append(i)
-
-        # Build index: CAN_ID -> list of sample indices (attack), if IDs provided
-        self.id_to_attack_indices = {}
-        if attack_ids is not None:
-            for i, cid in enumerate(attack_ids):
-                self.id_to_attack_indices.setdefault(cid, []).append(i)
+    @staticmethod
+    def _group(ids):
+        g = {}
+        for i, cid in enumerate(ids):
+            g.setdefault(cid, []).append(i)
+        return g
 
     def __len__(self):
         return len(self.normal)
 
     def __getitem__(self, idx):
-        anchor = self.normal[idx]
-        anchor_id = self.normal_ids[idx]
+        aid = self.normal_ids[idx]
 
-        # --- Positive: prefer same CAN_ID, else random (guarded against idx==pos_idx either way) ---
-        same_id_indices = self.id_to_normal_indices.get(anchor_id, [])
-        if len(same_id_indices) > 1:
-            pos_idx = idx
-            while pos_idx == idx:
-                pos_idx = same_id_indices[np.random.randint(len(same_id_indices))]
-        else:
-            pos_idx = idx
-            while pos_idx == idx:
-                pos_idx = np.random.randint(0, len(self.normal))
-        positive = self.normal[pos_idx]
+        pos_pool = self.id_to_normal.get(aid, [])
+        pos = pos_pool[np.random.randint(len(pos_pool))] if len(pos_pool) > 1 else np.random.randint(len(self.normal))
 
-        # --- Negative: prefer same CAN_ID attack sample if available, else random attack sample ---
-        same_id_attack_indices = self.id_to_attack_indices.get(anchor_id, [])
-        if len(same_id_attack_indices) > 0:
-            neg_idx = same_id_attack_indices[np.random.randint(len(same_id_attack_indices))]
-        else:
-            neg_idx = np.random.randint(0, len(self.attack))
-        negative = self.attack[neg_idx]
+        neg_pool = self.id_to_attack.get(aid, [])
+        neg = neg_pool[np.random.randint(len(neg_pool))] if neg_pool else np.random.randint(len(self.attack))
 
-        return anchor, positive, negative
+        return self.normal[idx], self.normal[pos], self.attack[neg]
 
 
-# ──────────────────────────────────────────────
-#  Data loading
-# ──────────────────────────────────────────────
+# ── Data loading ─────────────────────────────
 
-def load_normal_data():
-    """Load all normal (attack-free) training data with CAN_IDs."""
-    df = pd.read_csv(DATA_DIR / "Attack_free_training.csv")
-    feat_cols = [f"freq_bit_{i}" for i in range(64)]
-    return df[feat_cols].values.astype(np.float32), df["CAN_ID"].values
-
-
-def load_attack_data():
-    """Load all attack training data (DoS + Fuzzy + Impersonation), with CAN_IDs."""
-    frames = []
-    id_frames = []
-    for name in ["DoS_attack_training.csv", "Fuzzy_attack_training.csv", "Impersonation_attack_training.csv"]:
-        df = pd.read_csv(DATA_DIR / name)
-        feat_cols = [f"freq_bit_{i}" for i in range(64)]
-        frames.append(df[feat_cols].values.astype(np.float32))
-        id_frames.append(df["CAN_ID"].values)
-    return np.vstack(frames), np.concatenate(id_frames)
+def load_frames(csv_name):
+    df = pd.read_csv(DATA_DIR / csv_name)
+    return (
+        df["CAN_ID"].astype(str).values,
+        df["Timestamp"].values,
+        df[BYTE_COLS].values.astype(np.float32),
+        df["DLC"].values.astype(np.float32),
+    )
 
 
-# ──────────────────────────────────────────────
-#  Validation
-# ──────────────────────────────────────────────
+def chronological_split(n, val_ratio=0.15, test_ratio=0.15):
+    n_test = int(n * test_ratio)
+    n_val = int(n * val_ratio)
+    n_train = n - n_val - n_test
+    return np.arange(n_train), np.arange(n_train, n_train + n_val), np.arange(n_train + n_val, n)
+
+
+def prepare_data(val_ratio, test_ratio):
+    """Load per-frame CSVs, sort, split, fit top-30, build features."""
+    # Load
+    n_ids, n_ts, n_bytes, n_dlc = load_frames("Attack_free_frames.csv")
+    a_ids, a_ts, a_bytes, a_dlc = load_frames("DoS_attack_frames.csv")
+    for name in ["Fuzzy_attack_frames.csv", "Impersonation_attack_frames.csv"]:
+        ids, ts, by, dl = load_frames(name)
+        a_ids = np.concatenate([a_ids, ids])
+        a_ts = np.concatenate([a_ts, ts])
+        a_bytes = np.vstack([a_bytes, by])
+        a_dlc = np.concatenate([a_dlc, dl])
+
+    # Sort chronologically
+    n_order = n_ts.argsort()
+    a_order = a_ts.argsort()
+    n_ids, n_ts, n_bytes, n_dlc = n_ids[n_order], n_ts[n_order], n_bytes[n_order], n_dlc[n_order]
+    a_ids, a_ts, a_bytes, a_dlc = a_ids[a_order], a_ts[a_order], a_bytes[a_order], a_dlc[a_order]
+
+    # Split
+    ni, nv, nt = chronological_split(len(n_ids), val_ratio, test_ratio)
+    ai, av, at = chronological_split(len(a_ids), val_ratio, test_ratio)
+
+    # Fit top-30 on training normal only
+    top_ids = fit_top_ids(n_ids[ni])
+    with open(DATA_DIR / "top_can_ids.json", "w") as f:
+        json.dump(top_ids, f)
+    print(f"Saved top_can_ids.json")
+
+    # Build 40-dim features
+    n_feats = build_features(n_ids, top_ids, n_bytes, n_dlc)
+    a_feats = build_features(a_ids, top_ids, a_bytes, a_dlc)
+
+    splits = {
+        "train": (n_feats[ni], n_ids[ni], a_feats[ai], a_ids[ai]),
+        "val":   (n_feats[nv], n_ids[nv], a_feats[av], a_ids[av]),
+        "test":  (n_feats[nt], n_ids[nt], a_feats[at], a_ids[at]),
+    }
+
+    print(f"\nNormal: {len(n_ids):,} | Attack: {len(a_ids):,}")
+    for name in ("train", "val", "test"):
+        nf, _, af, _ = splits[name]
+        print(f"  {name:5s}: {len(nf):,} / {len(af):,}")
+
+    return splits
+
+
+def save_test_split(splits):
+    nf, ni, af, ai = splits["test"]
+    np.savez(DATA_DIR / "test_split.npz",
+             normal_test_feats=nf, normal_test_ids=ni,
+             attack_test_feats=af, attack_test_ids=ai)
+    print("Saved test_split.npz")
+
+
+# ── Threshold (training data only) ───────────
 
 @torch.no_grad()
-def validate(model, dataloader, device):
+def compute_threshold(model, feats, ids, device, percentile=99):
     model.eval()
+    tensor = torch.tensor(feats, dtype=torch.float32).to(device)
+    all_emb = []
+    for i in range(0, len(tensor), 256):
+        all_emb.append(model(tensor[i:i + 256]).cpu().numpy())
+    emb = np.vstack(all_emb)
+
+    ids = np.array(ids, dtype=str)
+    centroids = {}
+    for cid in np.unique(ids):
+        centroids[cid] = emb[ids == cid].mean(axis=0)
+
+    dists = np.array([
+        np.sum((e - centroids.get(c, emb.mean(axis=0))) ** 2)
+        for e, c in zip(emb, ids)
+    ])
+    threshold = float(np.percentile(dists, percentile))
+    print(f"Threshold ({percentile}th pct): {threshold:.6f}")
+    return threshold
+
+
+# ── Train / eval one epoch ───────────────────
+
+def run_epoch(model, loader, device, optimizer=None):
+    is_train = optimizer is not None
+    model.train() if is_train else model.eval()
     losses = []
-    for anchor, positive, negative in dataloader:
-        anchor = anchor.to(device)
-        positive = positive.to(device)
-        negative = negative.to(device)
-
-        emb_a, emb_p, emb_n = model(anchor, positive, negative)
-        loss = model.triplet_loss(emb_a, emb_p, emb_n)
-        losses.append(loss.item())
-
+    ctx = torch.enable_grad() if is_train else torch.no_grad()
+    with ctx:
+        for a, p, n in loader:
+            a, p, n = a.to(device), p.to(device), n.to(device)
+            ea, ep, en = model(a, p, n)
+            loss = model.triplet_loss(ea, ep, en)
+            if is_train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            losses.append(loss.item())
     return np.mean(losses)
 
 
-# ──────────────────────────────────────────────
-#  Training
-# ──────────────────────────────────────────────
-
-def train(
-    epochs=50,
-    batch_size=64,
-    lr=0.001,          # matches paper Section 4.2: "the learning rate of the network
-                        # training stage is 0.001" — kept as the default here
-    margin=1.0,         # paper does not state a numeric margin (alpha) value;
-                        # this is a chosen default, not taken from the paper
-    embedding_dim=16,   # paper leaves embedding dim d unspecified; chosen default
-    hidden_dims=None,   # NEW: lets you sweep hidden-layer count, matching the
-                         # paper's own Figure 6 experiment (2-16 hidden layers)
-    val_ratio=0.15,      # NEW: normal/attack val split
-    test_ratio=0.15,     # NEW: held-out test split, untouched by training/early-stopping
-    patience=10,
-    seed=42,
-    device=None,
-):
-    """
-    Deviations from the paper, documented here for the project writeup:
-
-      1. Mode/value information split (Section 4.1) is not implemented — the
-         paper's own description is ambiguous and appears inconsistent with the
-         bit-index ranges shown in Figure 5. The full 64-bit frequency vector is
-         used uniformly at both training and detection.
-
-      2. The paper's private CANoe-generated dataset is unavailable; a public
-         substitute (Car-Hacking-style: DoS / Fuzzy / Impersonation attacks) is
-         used instead. Absolute numbers should not be expected to match the
-         paper's reported results — the goal is to reproduce the *trend*
-         (DNN+Triplet outperforming DNN+SVM / DNN+Softmax as hidden layers
-         increase, then plateauing).
-
-      3. The paper does not state embedding dimension, margin value, batch size,
-         or exact train/val/test split for the attack portion of the data — all
-         of these are set here as explicit, documented defaults rather than
-         values taken from the paper.
-    """
-    # ── Seed ──
-    set_seed(seed)
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Seed: {seed}")
-
-    # ── Load data ──
-    print("Loading data...")
-    normal_feats, normal_ids = load_normal_data()
-    attack_feats, attack_ids = load_attack_data()
-    print(f"Normal samples: {len(normal_feats):,}")
-    print(f"Attack samples: {len(attack_feats):,}")
-
-    # ── Train / Validation / Test split ──
-    # Paper (Section 4.1) only specifies the split for *normal* packets (70/30
-    # train/validate). It does not state how attack packets are split. Here,
-    # BOTH normal and attack data are split the same way, and independently of
-    # each other, to avoid leaking attack samples between train/val/test
-    # (see earlier review: this was a real bug in the previous version, where
-    # the full unsplit attack pool was shared between train and val).
-    normal_idx = np.arange(len(normal_feats))
-    n_trainval, n_test = train_test_split(
-        normal_idx, test_size=test_ratio, random_state=seed, shuffle=True
-    )
-    n_train, n_val = train_test_split(
-        n_trainval, test_size=val_ratio / (1 - test_ratio), random_state=seed, shuffle=True
-    )
-
-    attack_idx = np.arange(len(attack_feats))
-    a_trainval, a_test = train_test_split(
-        attack_idx, test_size=test_ratio, random_state=seed, shuffle=True
-    )
-    a_train, a_val = train_test_split(
-        a_trainval, test_size=val_ratio / (1 - test_ratio), random_state=seed, shuffle=True
-    )
-
-    normal_train_feats, normal_train_ids = normal_feats[n_train], normal_ids[n_train]
-    normal_val_feats, normal_val_ids = normal_feats[n_val], normal_ids[n_val]
-    normal_test_feats, normal_test_ids = normal_feats[n_test], normal_ids[n_test]
-
-    attack_train_feats, attack_train_ids = attack_feats[a_train], attack_ids[a_train]
-    attack_val_feats, attack_val_ids = attack_feats[a_val], attack_ids[a_val]
-    attack_test_feats, attack_test_ids = attack_feats[a_test], attack_ids[a_test]
-
-    print(f"\nSplit (normal / attack):")
-    print(f"  Train:      {len(n_train):,} / {len(a_train):,}")
-    print(f"  Validation: {len(n_val):,} / {len(a_val):,}")
-    print(f"  Test:       {len(n_test):,} / {len(a_test):,}  (held out, untouched until final evaluate.py run)")
-
-    # Save the test split to disk so evaluate.py can use the SAME held-out set
-    # this run trained against (important: don't re-split randomly in evaluate.py,
-    # or you risk silently testing on data the model has already seen).
-    np.savez(
-        DATA_DIR / "test_split.npz",
-        normal_test_feats=normal_test_feats,
-        normal_test_ids=normal_test_ids,
-        attack_test_feats=attack_test_feats,
-        attack_test_ids=attack_test_ids,
-    )
-
-    # ── Datasets & loaders ──
-    train_dataset = TripletDataset(normal_train_feats, normal_train_ids, attack_train_feats, attack_train_ids)
-    val_dataset = TripletDataset(normal_val_feats, normal_val_ids, attack_val_feats, attack_val_ids)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
-
-    print(f"  Train batches:      {len(train_loader)}")
-    print(f"  Validation batches: {len(val_loader)}")
-
-    # ── Model ──
-    # hidden_dims exposed so you can reproduce the paper's Figure 6 sweep, e.g.:
-    #   train(hidden_dims=[64, 64])          # ~2 hidden layers
-    #   train(hidden_dims=[64]*7)            # ~14 hidden layers
-    model_kwargs = dict(input_dim=64, embedding_dim=embedding_dim, margin=margin)
-    if hidden_dims is not None:
-        model_kwargs["hidden_dims"] = hidden_dims  # requires SharedDNN to accept this kwarg
-    model = SiameseNetwork(**model_kwargs).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {total_params:,}")
-
-    # ── Training loop ──
-    print(f"\n{'='*60}")
-    print(f"Training for {epochs} epochs (early stopping: patience={patience})")
-    print(f"{'='*60}")
-
-    history = {"epoch": [], "train_loss": [], "val_loss": []}
-    best_val_loss = float("inf")
-    epochs_without_improvement = 0
-    epoch = 0  # guard in case epochs=0 is ever passed
-
-    for epoch in range(1, epochs + 1):
-
-        # --- Train ---
-        model.train()
-        train_losses = []
-        for anchor, positive, negative in train_loader:
-            anchor = anchor.to(device)
-            positive = positive.to(device)
-            negative = negative.to(device)
-
-            emb_a, emb_p, emb_n = model(anchor, positive, negative)
-            loss = model.triplet_loss(emb_a, emb_p, emb_n)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            train_losses.append(loss.item())
-
-        avg_train_loss = np.mean(train_losses)
-
-        # --- Validate ---
-        avg_val_loss = validate(model, val_loader, device)
-
-        history["epoch"].append(epoch)
-        history["train_loss"].append(avg_train_loss)
-        history["val_loss"].append(avg_val_loss)
-
-        improved = ""
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            epochs_without_improvement = 0
-            improved = " *"
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": best_val_loss,
-                "embedding_dim": embedding_dim,
-                "hidden_dims": hidden_dims,
-                "margin": margin,
-                "seed": seed,
-            }, MODEL_DIR / "best_model.pth")
-        else:
-            epochs_without_improvement += 1
-
-        print(f"Epoch {epoch:3d}/{epochs} | "
-              f"Train: {avg_train_loss:.6f} | "
-              f"Val: {avg_val_loss:.6f}{improved}")
-
-        # --- Early stopping ---
-        if epochs_without_improvement >= patience:
-            print(f"\nEarly stopping at epoch {epoch} (no improvement for {patience} epochs)")
-            break
-
-    # ── Save final model ──
+def save_checkpoint(path, model, optimizer, epoch, loss, **extra):
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "loss": avg_train_loss,
-        "embedding_dim": embedding_dim,
-        "hidden_dims": hidden_dims,
-        "margin": margin,
-        "seed": seed,
-    }, MODEL_DIR / "final_model.pth")
+        "loss": loss,
+        **extra,
+    }, path)
 
-    # ── Save history ──
-    history_df = pd.DataFrame(history)
-    history_df.to_csv(DATA_DIR / "training_history.csv", index=False)
 
-    print(f"\n{'='*60}")
-    print(f"Training complete!")
-    print(f"Best validation loss: {best_val_loss:.6f}")
-    print(f"Models saved to: {MODEL_DIR}")
-    print(f"Held-out test split saved to: {DATA_DIR / 'test_split.npz'} (use in evaluate.py)")
-    print(f"{'='*60}")
+# ── Main ─────────────────────────────────────
 
-    return model, history
+def train(
+    epochs=50,
+    batch_size=64,
+    lr=0.001,
+    margin=1.0,
+    embedding_dim=16,
+    hidden_dims=[16, 32],
+    val_ratio=0.15,
+    test_ratio=0.15,
+    patience=10,
+    seed=42,
+    threshold_percentile=99,
+    device=None,
+):
+    set_seed(seed)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    splits = prepare_data(val_ratio, test_ratio)
+    save_test_split(splits)
+
+    input_dim = 40
+    train_loader = DataLoader(TripletDataset(*splits["train"]), batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(TripletDataset(*splits["val"]), batch_size=batch_size)
+    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+
+    model = SiameseNetwork(
+        input_dim=input_dim, embedding_dim=embedding_dim, margin=margin, hidden_dims=hidden_dims
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    print(f"\n{'=' * 60}\nTraining for {epochs} epochs (patience={patience})\n{'=' * 60}")
+
+    history = {"epoch": [], "train_loss": [], "val_loss": []}
+    best_val_loss = float("inf")
+    stale = 0
+    threshold = 0.0
+
+    for epoch in range(1, epochs + 1):
+        train_loss = run_epoch(model, train_loader, device, optimizer)
+        val_loss = run_epoch(model, val_loader, device)
+
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        marker = ""
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            stale = 0
+            marker = " *"
+            threshold = compute_threshold(model, splits["train"][0], splits["train"][1], device, threshold_percentile)
+            save_checkpoint(
+                MODEL_DIR / "best_model.pth", model, optimizer, epoch, best_val_loss,
+                embedding_dim=embedding_dim, hidden_dims=hidden_dims, margin=margin,
+                seed=seed, threshold=threshold, input_dim=input_dim,
+            )
+        else:
+            stale += 1
+
+        print(f"Epoch {epoch:3d} | Train: {train_loss:.6f} | Val: {val_loss:.6f}{marker}")
+
+        if stale >= patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
+
+    # Reload best, recompute threshold, save final
+    best_ckpt = torch.load(MODEL_DIR / "best_model.pth", map_location=device, weights_only=False)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+    threshold = compute_threshold(model, splits["train"][0], splits["train"][1], device, threshold_percentile)
+
+    for tag, ep, ls in [("final_model.pth", epoch, train_loss), ("best_model.pth", best_ckpt["epoch"], best_val_loss)]:
+        save_checkpoint(
+            MODEL_DIR / tag, model, optimizer, ep, ls,
+            embedding_dim=embedding_dim, hidden_dims=hidden_dims, margin=margin,
+            seed=seed, threshold=threshold, input_dim=input_dim,
+        )
+
+    pd.DataFrame(history).to_csv(DATA_DIR / "training_history.csv", index=False)
+    print(f"\nDone! Best val loss: {best_val_loss:.6f} | Threshold: {threshold:.6f}")
 
 
 if __name__ == "__main__":
