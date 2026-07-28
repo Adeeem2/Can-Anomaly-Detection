@@ -12,7 +12,6 @@ MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 MODEL_DIR.mkdir(exist_ok=True)
 
 TOP_K = 30
-META_COLS = {"CAN_ID", "Timestamp"}
 BYTE_COLS = [f"byte_{i}" for i in range(8)]
 
 
@@ -20,9 +19,6 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
-
-
-# ── Fit / Transform ──────────────────────────
 
 def fit_top_ids(can_ids, k=TOP_K):
     """Learn top-k CAN IDs from training normal data only."""
@@ -39,15 +35,14 @@ def build_features(can_ids, top_ids, byte_arr, dlc_arr):
     id_map = {cid: i for i, cid in enumerate(top_ids)}
     for i, cid in enumerate(can_ids):
         f[i, id_map.get(cid, TOP_K)] = 1.0  # column TOP_K = "other"
-    f[:, TOP_K + 1 : TOP_K + 9] = byte_arr  # already /255 from features.py
-    f[:, TOP_K + 9] = dlc_arr                # already /8 from features.py
+    f[:, TOP_K + 1 : TOP_K + 9] = byte_arr  # already /255 from parser
+    f[:, TOP_K + 9] = dlc_arr                # already /8 from parser
     return f
-
 
 # ── Dataset ──────────────────────────────────
 
 class TripletDataset(Dataset):
-    """On-the-fly triplet generation with same-ID preference."""
+    """triplet generation with same-ID preference."""
 
     def __init__(self, normal_feats, normal_ids, attack_feats, attack_ids):
         self.normal = torch.tensor(normal_feats, dtype=torch.float32)
@@ -80,16 +75,6 @@ class TripletDataset(Dataset):
 
 # ── Data loading ─────────────────────────────
 
-def load_frames(csv_name):
-    df = pd.read_csv(DATA_DIR / csv_name)
-    return (
-        df["CAN_ID"].astype(str).values,
-        df["Timestamp"].values,
-        df[BYTE_COLS].values.astype(np.float32),
-        df["DLC"].values.astype(np.float32),
-    )
-
-
 def chronological_split(n, val_ratio=0.15, test_ratio=0.15):
     n_test = int(n * test_ratio)
     n_val = int(n * val_ratio)
@@ -97,27 +82,48 @@ def chronological_split(n, val_ratio=0.15, test_ratio=0.15):
     return np.arange(n_train), np.arange(n_train, n_train + n_val), np.arange(n_train + n_val, n)
 
 
-def prepare_data(val_ratio, test_ratio):
-    """Load per-frame CSVs, sort, split, fit top-30, build features."""
-    # Load
-    n_ids, n_ts, n_bytes, n_dlc = load_frames("Attack_free_frames.csv")
-    a_ids, a_ts, a_bytes, a_dlc = load_frames("DoS_attack_frames.csv")
-    for name in ["Fuzzy_attack_frames.csv", "Impersonation_attack_frames.csv"]:
-        ids, ts, by, dl = load_frames(name)
-        a_ids = np.concatenate([a_ids, ids])
-        a_ts = np.concatenate([a_ts, ts])
-        a_bytes = np.vstack([a_bytes, by])
-        a_dlc = np.concatenate([a_dlc, dl])
+def prepare_data(val_ratio=0.15):
+    """Load labeled frames CSV, separate by attack label, split chronologically.
 
-    # Sort chronologically
+    Normal frames are split chronologically (85/15 train/val).
+    Attack frames are split stratified by attack type within chronological order
+    (ensures every split has all attack types).
+    """
+    df = pd.read_csv(DATA_DIR / "set01_train_frames.csv")
+
+    n_mask = df["attack"].values == 0
+    a_mask = df["attack"].values == 1
+
+    n_ids = df.loc[n_mask, "CAN_ID"].astype(str).values
+    n_ts = df.loc[n_mask, "Timestamp"].values
+    n_bytes = df.loc[n_mask, BYTE_COLS].values.astype(np.float32)
+    n_dlc = df.loc[n_mask, "DLC"].values.astype(np.float32)
+
+    a_ids = df.loc[a_mask, "CAN_ID"].astype(str).values
+    a_ts = df.loc[a_mask, "Timestamp"].values
+    a_bytes = df.loc[a_mask, BYTE_COLS].values.astype(np.float32)
+    a_dlc = df.loc[a_mask, "DLC"].values.astype(np.float32)
+    a_types = df.loc[a_mask, "attack_type"].values.astype(str)
+
+    # Sort normal chronologically and split
     n_order = n_ts.argsort()
-    a_order = a_ts.argsort()
-    n_ids, n_ts, n_bytes, n_dlc = n_ids[n_order], n_ts[n_order], n_bytes[n_order], n_dlc[n_order]
-    a_ids, a_ts, a_bytes, a_dlc = a_ids[a_order], a_ts[a_order], a_bytes[a_order], a_dlc[a_order]
+    n_ids, n_ts, n_bytes, n_dlc = (
+        n_ids[n_order], n_ts[n_order], n_bytes[n_order], n_dlc[n_order]
+    )
+    ni, nv = chronological_split(len(n_ids), val_ratio, 0.0)
 
-    # Split
-    ni, nv, nt = chronological_split(len(n_ids), val_ratio, test_ratio)
-    ai, av, at = chronological_split(len(a_ids), val_ratio, test_ratio)
+    # Split attack stratified by type (chronological within each type)
+    ai_idx, av_idx = [], []
+    for atype in np.unique(a_types):
+        type_mask = a_types == atype
+        type_orig_idx = np.where(type_mask)[0]
+        type_order = a_ts[type_mask].argsort()
+        type_orig_idx = type_orig_idx[type_order]
+        ti, tv, _ = chronological_split(len(type_orig_idx), val_ratio, 0.0)
+        ai_idx.extend(type_orig_idx[ti])
+        av_idx.extend(type_orig_idx[tv])
+    ai = np.sort(ai_idx)
+    av = np.sort(av_idx)
 
     # Fit top-30 on training normal only
     top_ids = fit_top_ids(n_ids[ni])
@@ -130,37 +136,16 @@ def prepare_data(val_ratio, test_ratio):
     a_feats = build_features(a_ids, top_ids, a_bytes, a_dlc)
 
     splits = {
-        "train": (n_feats[ni], n_ids[ni], a_feats[ai], a_ids[ai]),
-        "val":   (n_feats[nv], n_ids[nv], a_feats[av], a_ids[av]),
-        "test":  (n_feats[nt], n_ids[nt], a_feats[at], a_ids[at]),
+        "train": (n_feats[ni], n_ids[ni], a_feats[ai], a_ids[ai], a_types[ai]),
+        "val":   (n_feats[nv], n_ids[nv], a_feats[av], a_ids[av], a_types[av]),
     }
 
     print(f"\nNormal: {len(n_ids):,} | Attack: {len(a_ids):,}")
-    for name in ("train", "val", "test"):
-        nf, _, af, _ = splits[name]
+    for name in ("train", "val"):
+        nf, _, af, _, _ = splits[name]
         print(f"  {name:5s}: {len(nf):,} / {len(af):,}")
 
-    # Subsample training data for fast training
-    MAX_TRAIN = 150_000
-    nf, ni, af, ai = splits["train"]
-    if len(nf) > MAX_TRAIN:
-        idx = np.random.choice(len(nf), MAX_TRAIN, replace=False)
-        nf, ni = nf[idx], ni[idx]
-    if len(af) > MAX_TRAIN:
-        idx = np.random.choice(len(af), MAX_TRAIN, replace=False)
-        af, ai = af[idx], ai[idx]
-    splits["train"] = (nf, ni, af, ai)
-    print(f"Train subsampled to: {len(nf):,} / {len(af):,}")
-
     return splits
-
-
-def save_test_split(splits):
-    nf, ni, af, ai = splits["test"]
-    np.savez(DATA_DIR / "test_split.npz",
-             normal_test_feats=nf, normal_test_ids=ni,
-             attack_test_feats=af, attack_test_ids=ai)
-    print("Saved test_split.npz")
 
 
 # ── Threshold (training data only) ───────────
@@ -222,13 +207,12 @@ def save_checkpoint(path, model, optimizer, epoch, loss, **extra):
 
 def train(
     epochs=50,
-    batch_size=64,
+    batch_size=256,
     lr=0.001,
     margin=1.0,
     embedding_dim=16,
     hidden_dims=[16, 32],
     val_ratio=0.15,
-    test_ratio=0.15,
     patience=10,
     seed=42,
     threshold_percentile=99,
@@ -238,12 +222,11 @@ def train(
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    splits = prepare_data(val_ratio, test_ratio)
-    save_test_split(splits)
+    splits = prepare_data(val_ratio)
 
     input_dim = 40
-    train_loader = DataLoader(TripletDataset(*splits["train"]), batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(TripletDataset(*splits["val"]), batch_size=batch_size)
+    train_loader = DataLoader(TripletDataset(*splits["train"][:4]), batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(TripletDataset(*splits["val"][:4]), batch_size=batch_size)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     model = SiameseNetwork(

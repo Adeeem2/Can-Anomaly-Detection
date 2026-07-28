@@ -1,4 +1,5 @@
 import torch
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,6 +12,7 @@ from sklearn.metrics import (
 from sklearn.manifold import TSNE
 
 from src.model import SiameseNetwork
+from src.train import build_features, BYTE_COLS, TOP_K
 
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
@@ -197,63 +199,85 @@ def plot_tsne(normal_feats, attack_feats, model, device, n_samples=2000):
 #  Main evaluation
 # ──────────────────────────────────────────────
 
-def load_test_split():
-    """Load the held-out test split saved by train.py."""
-    split_path = DATA_DIR / "test_split.npz"
-    data = np.load(split_path, allow_pickle=True)
-    return (
-        data["normal_test_feats"],
-        np.array(data["normal_test_ids"], dtype=str),
-        data["attack_test_feats"],
-        np.array(data["attack_test_ids"], dtype=str),
+def load_test_csv(csv_path, top_ids):
+    """Load a parsed test CSV and build 40-dim features, split normal/attack."""
+    df = pd.read_csv(csv_path)
+    n_mask = df["attack"].values == 0
+    a_mask = df["attack"].values == 1
+    n_ids = df.loc[n_mask, "CAN_ID"].astype(str).values
+    n_feats = build_features(
+        n_ids, top_ids,
+        df.loc[n_mask, BYTE_COLS].values.astype(np.float32),
+        df.loc[n_mask, "DLC"].values.astype(np.float32),
     )
+    a_ids = df.loc[a_mask, "CAN_ID"].astype(str).values
+    a_feats = build_features(
+        a_ids, top_ids,
+        df.loc[a_mask, BYTE_COLS].values.astype(np.float32),
+        df.loc[a_mask, "DLC"].values.astype(np.float32),
+    )
+    a_types = df.loc[a_mask, "attack_type"].values.astype(str)
+    print(f"  Normal={len(n_feats):,} | Attack={len(a_feats):,} | Types: {np.unique(a_types)}")
+    return n_feats, n_ids, a_feats, a_ids, a_types
 
 
 def evaluate(checkpoint="best_model.pth"):
     model, device, threshold = load_model(checkpoint)
-
     if threshold is None:
         raise ValueError("No threshold found in checkpoint. Re-run train.py to generate one.")
 
-    # Load the SAME held-out test split that train.py produced
-    normal_feats, normal_ids, attack_feats, attack_ids = load_test_split()
-    print(f"Test split: Normal={len(normal_feats):,} | Attack={len(attack_feats):,}")
+    with open(DATA_DIR / "top_can_ids.json") as f:
+        top_ids = json.load(f)
 
-    # Detect (using threshold from training, no leakage)
-    y_true, y_pred, y_scores, normal_dists, attack_dists = detect(
-        model, normal_feats, normal_ids, attack_feats, attack_ids, device, threshold
-    )
+    test_csvs = sorted(DATA_DIR.glob("set01_test_*_frames.csv"))
+    if not test_csvs:
+        raise FileNotFoundError("No test CSVs found in data/. Run parse_can_train_test.py first.")
 
-    # Threshold-dependent metrics
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred)
-    rec = recall_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
+    all_results = {}
+    for csv_path in test_csvs:
+        test_name = csv_path.stem.replace("set01_", "").replace("_frames", "")
+        print(f"\n{'='*60}")
+        print(f"Test set: {test_name}")
+        print(f"{'='*60}")
+        nf, ni, af, ai, atypes = load_test_csv(csv_path, top_ids)
+        y_true, y_pred, y_scores, nd, ad = detect(model, nf, ni, af, ai, device, threshold)
 
-    # Threshold-independent metric: PR-AUC
-    pr_auc = average_precision_score(y_true, y_scores)
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred)
+        rec = recall_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred)
+        pr_auc = average_precision_score(y_true, y_scores)
+
+        print(f"\nOverall:")
+        print(f"  Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f}")
+        print(f"  F1: {f1:.4f} | PR-AUC: {pr_auc:.4f}  (primary)")
+
+        print(f"\n{'Type':<20s} {'PR-AUC':>8s} {'F1':>8s} {'Recall':>8s} {'N':>8s}")
+        print(f"{'-'*52}")
+        for atype in np.unique(atypes):
+            mask = atypes == atype
+            n = mask.sum()
+            at_scores = ad[mask]
+            at_pred = (ad > threshold).astype(int)[mask]
+            at_pr_auc = average_precision_score(np.ones(n), at_scores) if n > 0 else 0
+            at_f1 = f1_score(np.ones(n), at_pred) if n > 0 else 0
+            at_rec = recall_score(np.ones(n), at_pred) if n > 0 else 0
+            print(f"{atype:<20s} {at_pr_auc:>8.4f} {at_f1:>8.4f} {at_rec:>8.4f} {n:>8,}")
+
+        all_results[test_name] = {
+            "accuracy": acc, "precision": prec, "recall": rec,
+            "f1": f1, "pr_auc": pr_auc,
+        }
 
     print(f"\n{'='*60}")
-    print(f"METRICS")
+    print(f"  SUMMARY (all test sets)")
     print(f"{'='*60}")
-    print(f"Accuracy:    {acc:.4f}")
-    print(f"Precision:   {prec:.4f}")
-    print(f"Recall:      {rec:.4f}")
-    print(f"F1 Score:    {f1:.4f}")
-    print(f"PR-AUC:      {pr_auc:.4f}  (threshold-independent)")
-    print(f"{'='*60}")
+    print(f"{'Test Set':<45s} {'PR-AUC':>8s} {'F1':>8s}")
+    print(f"{'-'*61}")
+    for name, res in all_results.items():
+        print(f"{name:<45s} {res['pr_auc']:>8.4f} {res['f1']:>8.4f}")
 
-    # Plots
-    plot_loss_curve()
-    plot_distance_distribution(normal_dists, attack_dists, threshold)
-    plot_pr_curve(y_true, y_scores, pr_auc)
-    plot_confusion_matrix(y_true, y_pred)
-    plot_tsne(normal_feats, attack_feats, model, device)
-
-    return {
-        "accuracy": acc, "precision": prec, "recall": rec,
-        "f1": f1, "pr_auc": pr_auc, "threshold": threshold,
-    }
+    return all_results
 
 
 if __name__ == "__main__":
