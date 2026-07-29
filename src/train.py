@@ -4,6 +4,7 @@ import pandas as pd
 import json
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
+from tqdm import tqdm
 
 from src.model import SiameseNetwork
 
@@ -75,20 +76,32 @@ class TripletDataset(Dataset):
 
 # ── Data loading ─────────────────────────────
 
-def chronological_split(n, val_ratio=0.15, test_ratio=0.15):
-    n_test = int(n * test_ratio)
+def chronological_split(n, val_ratio=0.15):
     n_val = int(n * val_ratio)
-    n_train = n - n_val - n_test
-    return np.arange(n_train), np.arange(n_train, n_train + n_val), np.arange(n_train + n_val, n)
+    n_train = n - n_val
+    train_idx = np.arange(n_train)
+    val_idx = np.arange(n_train, n)
+    return train_idx, val_idx
 
 
 def prepare_data(val_ratio=0.15):
-    """Load labeled frames CSV, separate by attack label, split chronologically.
+    """Load pre-built .npz (fast) or fall back to CSV parsing + build_features."""
+    npz_path = DATA_DIR / "train_data.npz"
+    if npz_path.exists():
+        print("Loading pre-built train_data.npz ...")
+        d = np.load(npz_path, allow_pickle=True)
+        splits = {
+            "train": (d["train_feats"], d["train_ids"],
+                      d["train_attack_feats"], d["train_attack_ids"],
+                      d["train_attack_types"]),
+            "val":   (d["val_feats"], d["val_ids"],
+                      d["val_attack_feats"], d["val_attack_ids"],
+                      d["val_attack_types"]),
+        }
+        print(f"  train: {len(d['train_feats']):,} / {len(d['train_attack_feats']):,}")
+        print(f"  val:   {len(d['val_feats']):,} / {len(d['val_attack_feats']):,}")
+        return splits
 
-    Normal frames are split chronologically (85/15 train/val).
-    Attack frames are split stratified by attack type within chronological order
-    (ensures every split has all attack types).
-    """
     df = pd.read_csv(DATA_DIR / "set01_train_frames.csv")
 
     n_mask = df["attack"].values == 0
@@ -110,7 +123,7 @@ def prepare_data(val_ratio=0.15):
     n_ids, n_ts, n_bytes, n_dlc = (
         n_ids[n_order], n_ts[n_order], n_bytes[n_order], n_dlc[n_order]
     )
-    ni, nv = chronological_split(len(n_ids), val_ratio, 0.0)
+    ni, nv = chronological_split(len(n_ids), val_ratio)
 
     # Split attack stratified by type (chronological within each type)
     ai_idx, av_idx = [], []
@@ -119,7 +132,7 @@ def prepare_data(val_ratio=0.15):
         type_orig_idx = np.where(type_mask)[0]
         type_order = a_ts[type_mask].argsort()
         type_orig_idx = type_orig_idx[type_order]
-        ti, tv, _ = chronological_split(len(type_orig_idx), val_ratio, 0.0)
+        ti, tv = chronological_split(len(type_orig_idx), val_ratio)
         ai_idx.extend(type_orig_idx[ti])
         av_idx.extend(type_orig_idx[tv])
     ai = np.sort(ai_idx)
@@ -148,26 +161,31 @@ def prepare_data(val_ratio=0.15):
     return splits
 
 
-# ── Threshold (training data only) ───────────
+# ── Threshold (validation normal data) ──────
 
 @torch.no_grad()
 def compute_threshold(model, feats, ids, device, percentile=99):
     model.eval()
     tensor = torch.tensor(feats, dtype=torch.float32).to(device)
     all_emb = []
-    for i in range(0, len(tensor), 256):
+    for i in tqdm(range(0, len(tensor), 256), desc="Threshold embed", leave=False):
         all_emb.append(model.shared_dnn(tensor[i:i + 256]).cpu().numpy())
     emb = np.vstack(all_emb)
 
     ids = np.array(ids, dtype=str)
-    centroids = {}
-    for cid in np.unique(ids):
-        centroids[cid] = emb[ids == cid].mean(axis=0)
+    emb_mean = emb.mean(axis=0)
+    dists = np.zeros(len(emb))
+    for cid in tqdm(np.unique(ids), desc="Threshold centroids", leave=False):
+        mask = ids == cid
+        centroid = emb[mask].mean(axis=0)
+        diff = emb[mask] - centroid[None, :]
+        dists[mask] = np.sum(diff * diff, axis=1)
+    # IDs with zero dist were not assigned a centroid (shouldn't happen here)
+    unassigned = dists == 0
+    if unassigned.any():
+        diff = emb[unassigned] - emb_mean[None, :]
+        dists[unassigned] = np.sum(diff * diff, axis=1)
 
-    dists = np.array([
-        np.sum((e - centroids.get(c, emb.mean(axis=0))) ** 2)
-        for e, c in zip(emb, ids)
-    ])
     threshold = float(np.percentile(dists, percentile))
     print(f"Threshold ({percentile}th pct): {threshold:.6f}")
     return threshold
@@ -175,13 +193,14 @@ def compute_threshold(model, feats, ids, device, percentile=99):
 
 # ── Train / eval one epoch ───────────────────
 
-def run_epoch(model, loader, device, optimizer=None):
+def run_epoch(model, loader, device, optimizer=None, desc=None):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
     losses = []
     ctx = torch.enable_grad() if is_train else torch.no_grad()
+    pbar = tqdm(loader, desc=desc or ("train" if is_train else "val"), leave=False)
     with ctx:
-        for a, p, n in loader:
+        for a, p, n in pbar:
             a, p, n = a.to(device), p.to(device), n.to(device)
             ea, ep, en = model(a, p, n)
             loss = model.triplet_loss(ea, ep, en)
@@ -190,6 +209,7 @@ def run_epoch(model, loader, device, optimizer=None):
                 loss.backward()
                 optimizer.step()
             losses.append(loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.6f}")
     return np.mean(losses)
 
 
@@ -206,7 +226,7 @@ def save_checkpoint(path, model, optimizer, epoch, loss, **extra):
 # ── Main ─────────────────────────────────────
 
 def train(
-    epochs=50,
+    epochs=5,
     batch_size=256,
     lr=0.001,
     margin=1.0,
@@ -225,8 +245,9 @@ def train(
     splits = prepare_data(val_ratio)
 
     input_dim = 40
-    train_loader = DataLoader(TripletDataset(*splits["train"][:4]), batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(TripletDataset(*splits["val"][:4]), batch_size=batch_size)
+    loader_kw = dict(batch_size=batch_size, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(TripletDataset(*splits["train"][:4]), shuffle=True, drop_last=True, **loader_kw)
+    val_loader = DataLoader(TripletDataset(*splits["val"][:4]), **loader_kw)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
     model = SiameseNetwork(
@@ -240,11 +261,10 @@ def train(
     history = {"epoch": [], "train_loss": [], "val_loss": []}
     best_val_loss = float("inf")
     stale = 0
-    threshold = 0.0
 
     for epoch in range(1, epochs + 1):
-        train_loss = run_epoch(model, train_loader, device, optimizer)
-        val_loss = run_epoch(model, val_loader, device)
+        train_loss = run_epoch(model, train_loader, device, optimizer, desc=f"E{epoch} train")
+        val_loss = run_epoch(model, val_loader, device, desc=f"E{epoch} val")
 
         history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
@@ -255,11 +275,10 @@ def train(
             best_val_loss = val_loss
             stale = 0
             marker = " *"
-            threshold = compute_threshold(model, splits["train"][0], splits["train"][1], device, threshold_percentile)
             save_checkpoint(
                 MODEL_DIR / "best_model.pth", model, optimizer, epoch, best_val_loss,
                 embedding_dim=embedding_dim, hidden_dims=hidden_dims, margin=margin,
-                seed=seed, threshold=threshold, input_dim=input_dim,
+                seed=seed, threshold=0.0, input_dim=input_dim,
             )
         else:
             stale += 1
@@ -270,10 +289,11 @@ def train(
             print(f"\nEarly stopping at epoch {epoch}")
             break
 
-    # Reload best, recompute threshold, save final
+    # Reload best, compute threshold on val normal data (1.6M, not 9M), save final
     best_ckpt = torch.load(MODEL_DIR / "best_model.pth", map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
-    threshold = compute_threshold(model, splits["train"][0], splits["train"][1], device, threshold_percentile)
+    print("\nComputing threshold on validation normal data ...")
+    threshold = compute_threshold(model, splits["val"][0], splits["val"][1], device, threshold_percentile)
 
     for tag, ep, ls in [("final_model.pth", epoch, train_loss), ("best_model.pth", best_ckpt["epoch"], best_val_loss)]:
         save_checkpoint(
