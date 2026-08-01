@@ -9,10 +9,9 @@ from sklearn.metrics import (
     f1_score, confusion_matrix, ConfusionMatrixDisplay,
     average_precision_score, precision_recall_curve,
 )
-from sklearn.manifold import TSNE
 
-from src.model import SiameseNetwork
-from src.train import build_features, BYTE_COLS, TOP_K
+from src.model import Autoencoder
+from src.train import can_ids_to_indices, BYTE_COLS, TOP_K
 
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
@@ -26,83 +25,51 @@ def load_model(checkpoint="best_model.pth", device=None):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(MODEL_DIR / checkpoint, map_location=device, weights_only=False)
-    input_dim = ckpt.get("input_dim", 40)
-    embedding_dim = ckpt.get("embedding_dim", 16)
-    hidden_dims = ckpt.get("hidden_dims", None)
-    margin = ckpt.get("margin", 1.0)
     threshold = ckpt.get("threshold", None)
 
-    siamese = SiameseNetwork(input_dim=input_dim, embedding_dim=embedding_dim, margin=margin, hidden_dims=hidden_dims).to(device)
-    siamese.load_state_dict(ckpt["model_state_dict"])
-    siamese.eval()
-    model = siamese.shared_dnn
+    with open(DATA_DIR / "top_can_ids.json") as f:
+        top_ids = json.load(f)
+    num_ids = len(top_ids) + 1
 
-    print(f"Loaded model from epoch {ckpt['epoch']}, val_loss={ckpt['loss']:.6f}")
+    model = Autoencoder(num_ids=num_ids).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    print(f"Loaded autoencoder from epoch {ckpt['epoch']}, val_loss={ckpt['loss']:.6f}")
     if threshold is not None:
-        print(f"Threshold (from training data): {threshold:.6f}")
+        print(f"Threshold: {threshold:.6f}")
     else:
         print("WARNING: No threshold found in checkpoint!")
     return model, device, threshold
 
 
-def get_embeddings(model, features, device, batch_size=256):
+def get_reconstruction_errors(model, id_indices, payload, device, batch_size=256):
     model.eval()
-    all_emb = []
+    all_errs = []
     with torch.no_grad():
-        for i in range(0, len(features), batch_size):
-            batch = torch.tensor(features[i:i+batch_size], dtype=torch.float32).to(device)
-            emb = model(batch)
-            all_emb.append(emb.cpu().numpy())
-    return np.vstack(all_emb)
+        for i in range(0, len(id_indices), batch_size):
+            idx_batch = torch.tensor(id_indices[i:i+batch_size], dtype=torch.long).to(device)
+            pay_batch = torch.tensor(payload[i:i+batch_size], dtype=torch.float32).to(device)
+            err = model.get_reconstruction_error(idx_batch, pay_batch)
+            all_errs.append(err.cpu().numpy())
+    return np.concatenate(all_errs)
 
+def detect(model, n_id_idx, n_payload, a_id_idx, a_payload, device, threshold):
+    normal_errs = get_reconstruction_errors(model, n_id_idx, n_payload, device)
+    attack_errs = get_reconstruction_errors(model, a_id_idx, a_payload, device)
 
-def detect(model, normal_feats, normal_ids, attack_feats, attack_ids, device, threshold):
-    """
-    Detection logic (per-ID centroids, fixed threshold from training):
-        1. Build per-ID centroids from normal test data
-        2. Compute distances to own-ID centroids
-        3. Apply threshold saved during training (no threshold leakage)
-    """
-    # Compute embeddings
-    normal_emb = get_embeddings(model, normal_feats, device)
-    attack_emb = get_embeddings(model, attack_feats, device)
-
-    # Build per-ID centroids from normal test data
-    id_centroids = {}
-    unique_ids = np.unique(normal_ids)
-    for cid in unique_ids:
-        mask = normal_ids == cid
-        id_centroids[cid] = normal_emb[mask].mean(axis=0)
-
-    # Fallback: global centroid
-    global_centroid = normal_emb.mean(axis=0, keepdims=True)
-
-    # Compute distances (to own-ID centroid if available, else global)
-    def compute_dist_to_centroid(emb, ids):
-        dists = np.zeros(len(emb))
-        for i, cid in enumerate(ids):
-            if cid in id_centroids:
-                centroid = id_centroids[cid]
-            else:
-                centroid = global_centroid[0]
-            dists[i] = np.sum((emb[i] - centroid) ** 2)
-        return dists
-
-    normal_dists = compute_dist_to_centroid(normal_emb, normal_ids)
-    attack_dists = compute_dist_to_centroid(attack_emb, attack_ids)
-
-    # Apply threshold from training (no computation from test data)
     print(f"Threshold: {threshold:.6f}")
+    print(f"  Normal reconstruction error: mean={normal_errs.mean():.6f} std={normal_errs.std():.6f}")
+    print(f"  Attack reconstruction error: mean={attack_errs.mean():.6f} std={attack_errs.std():.6f}")
 
-    # Predictions
-    normal_preds = (normal_dists > threshold).astype(int)
-    attack_preds = (attack_dists > threshold).astype(int)
+    normal_preds = (normal_errs > threshold).astype(int)
+    attack_preds = (attack_errs > threshold).astype(int)
 
-    y_true = np.concatenate([np.zeros(len(normal_dists)), np.ones(len(attack_dists))])
+    y_true = np.concatenate([np.zeros(len(normal_errs)), np.ones(len(attack_errs))])
     y_pred = np.concatenate([normal_preds, attack_preds])
-    y_scores = np.concatenate([normal_dists, attack_dists])
+    y_scores = np.concatenate([normal_errs, attack_errs])
 
-    return y_true, y_pred, y_scores, normal_dists, attack_dists
+    return y_true, y_pred, y_scores, normal_errs, attack_errs
 
 
 # ──────────────────────────────────────────────
@@ -115,7 +82,7 @@ def plot_loss_curve():
     plt.plot(history["epoch"], history["train_loss"], linewidth=2, label="Train")
     plt.plot(history["epoch"], history["val_loss"], linewidth=2, label="Validation", linestyle="--")
     plt.xlabel("Epoch")
-    plt.ylabel("Triplet Loss")
+    plt.ylabel("MSE Loss")
     plt.title("Training & Validation Loss Curve")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -125,74 +92,50 @@ def plot_loss_curve():
     print("Saved: figures/loss_curve.png")
 
 
-def plot_distance_distribution(normal_dists, attack_dists, threshold):
+def plot_error_distribution(normal_errs, attack_errs, threshold, tag=""):
     plt.figure(figsize=(10, 5))
-    plt.hist(normal_dists, bins=80, alpha=0.7, label="Normal", color="green", density=True)
-    plt.hist(attack_dists, bins=80, alpha=0.7, label="Attack", color="red", density=True)
-    plt.axvline(x=threshold, color="black", linestyle="--", linewidth=2, label=f"Threshold={threshold:.4f}")
-    plt.xlabel("Distance to Centroid")
+    plt.hist(normal_errs, bins=80, alpha=0.7, label="Normal", color="green", density=True)
+    plt.hist(attack_errs, bins=80, alpha=0.7, label="Attack", color="red", density=True)
+    plt.axvline(x=threshold, color="black", linestyle="--", linewidth=2, label=f"Threshold={threshold:.6f}")
+    plt.xlabel("Reconstruction MSE")
     plt.ylabel("Density")
-    plt.title("Distance Distribution: Normal vs Attack")
+    plt.title(f"Reconstruction Error: Normal vs Attack ({tag})")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "distance_distribution.png", dpi=150)
+    fname = f"error_distribution_{tag}.png" if tag else "error_distribution.png"
+    plt.savefig(FIG_DIR / fname, dpi=150)
     plt.close()
-    print("Saved: figures/distance_distribution.png")
+    print(f"Saved: figures/{fname}")
 
 
-def plot_pr_curve(y_true, y_scores, pr_auc):
+def plot_pr_curve(y_true, y_scores, pr_auc, tag=""):
     precision, recall, _ = precision_recall_curve(y_true, y_scores)
     plt.figure(figsize=(8, 6))
     plt.plot(recall, precision, linewidth=2, label=f"PR-AUC = {pr_auc:.4f}")
     plt.xlabel("Recall")
     plt.ylabel("Precision")
-    plt.title("Precision-Recall Curve")
+    plt.title(f"Precision-Recall Curve ({tag})")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "pr_curve.png", dpi=150)
+    fname = f"pr_curve_{tag}.png" if tag else "pr_curve.png"
+    plt.savefig(FIG_DIR / fname, dpi=150)
     plt.close()
-    print("Saved: figures/pr_curve.png")
+    print(f"Saved: figures/{fname}")
 
 
-def plot_confusion_matrix(y_true, y_pred):
+def plot_confusion_matrix(y_true, y_pred, tag=""):
     cm = confusion_matrix(y_true, y_pred)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Normal", "Attack"])
     fig, ax = plt.subplots(figsize=(6, 6))
     disp.plot(ax=ax, cmap="Blues")
-    plt.title("Confusion Matrix")
+    plt.title(f"Confusion Matrix ({tag})")
     plt.tight_layout()
-    plt.savefig(FIG_DIR / "confusion_matrix.png", dpi=150)
+    fname = f"confusion_matrix_{tag}.png" if tag else "confusion_matrix.png"
+    plt.savefig(FIG_DIR / fname, dpi=150)
     plt.close()
-    print("Saved: figures/confusion_matrix.png")
-
-
-def plot_tsne(normal_feats, attack_feats, model, device, n_samples=2000):
-    n = min(n_samples, len(normal_feats), len(attack_feats))
-    feats = np.vstack([normal_feats[:n], attack_feats[:n]])
-    labels = np.array([0]*n + [1]*n)
-
-    emb = get_embeddings(model, feats, device)
-
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
-    emb_2d = tsne.fit_transform(emb)
-
-    plt.figure(figsize=(10, 8))
-    colors = ["green", "red"]
-    names = ["Normal", "Attack"]
-    for i in range(2):
-        mask = labels == i
-        plt.scatter(emb_2d[mask, 0], emb_2d[mask, 1], c=colors[i], label=names[i], alpha=0.5, s=10)
-    plt.legend(fontsize=12)
-    plt.title("t-SNE Visualization of Embeddings")
-    plt.xlabel("t-SNE 1")
-    plt.ylabel("t-SNE 2")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(FIG_DIR / "tsne_embeddings.png", dpi=150)
-    plt.close()
-    print("Saved: figures/tsne_embeddings.png")
+    print(f"Saved: figures/{fname}")
 
 
 # ──────────────────────────────────────────────
@@ -200,31 +143,31 @@ def plot_tsne(normal_feats, attack_feats, model, device, n_samples=2000):
 # ──────────────────────────────────────────────
 
 def load_test_csv(csv_path, top_ids):
-    """Load a parsed test CSV and build 40-dim features, split normal/attack."""
+    """Load a parsed test CSV and return 9-dim payload + CAN ID indices."""
     df = pd.read_csv(csv_path)
     n_mask = df["attack"].values == 0
     a_mask = df["attack"].values == 1
-    n_ids = df.loc[n_mask, "CAN_ID"].astype(str).values
-    n_feats = build_features(
-        n_ids, top_ids,
-        df.loc[n_mask, BYTE_COLS].values.astype(np.float32),
-        df.loc[n_mask, "DLC"].values.astype(np.float32),
-    )
-    a_ids = df.loc[a_mask, "CAN_ID"].astype(str).values
-    a_feats = build_features(
-        a_ids, top_ids,
-        df.loc[a_mask, BYTE_COLS].values.astype(np.float32),
-        df.loc[a_mask, "DLC"].values.astype(np.float32),
-    )
+
+    def extract(id_mask):
+        ids = df.loc[id_mask, "CAN_ID"].astype(str).values
+        id_idx = can_ids_to_indices(ids, top_ids)
+        payload = np.hstack([
+            df.loc[id_mask, BYTE_COLS].values.astype(np.float32),
+            df.loc[id_mask, "DLC"].values.astype(np.float32).reshape(-1, 1),
+        ]).astype(np.float32)
+        return id_idx, payload
+
+    n_id_idx, n_payload = extract(n_mask)
+    a_id_idx, a_payload = extract(a_mask)
     a_types = df.loc[a_mask, "attack_type"].values.astype(str)
-    print(f"  Normal={len(n_feats):,} | Attack={len(a_feats):,} | Types: {np.unique(a_types)}")
-    return n_feats, n_ids, a_feats, a_ids, a_types
+    print(f"  Normal={len(n_payload):,} | Attack={len(a_payload):,} | Types: {np.unique(a_types)}")
+    return n_id_idx, n_payload, a_id_idx, a_payload, a_types
 
 
 def evaluate(checkpoint="best_model.pth"):
     model, device, threshold = load_model(checkpoint)
     if threshold is None:
-        raise ValueError("No threshold found in checkpoint. Re-run train.py to generate one.")
+        raise ValueError("No threshold found in checkpoint.")
 
     with open(DATA_DIR / "top_can_ids.json") as f:
         top_ids = json.load(f)
@@ -239,8 +182,8 @@ def evaluate(checkpoint="best_model.pth"):
         print(f"\n{'='*60}")
         print(f"Test set: {test_name}")
         print(f"{'='*60}")
-        nf, ni, af, ai, atypes = load_test_csv(csv_path, top_ids)
-        y_true, y_pred, y_scores, nd, ad = detect(model, nf, ni, af, ai, device, threshold)
+        n_id_idx, n_payload, a_id_idx, a_payload, atypes = load_test_csv(csv_path, top_ids)
+        y_true, y_pred, y_scores, ne, ae = detect(model, n_id_idx, n_payload, a_id_idx, a_payload, device, threshold)
 
         acc = accuracy_score(y_true, y_pred)
         prec = precision_score(y_true, y_pred)
@@ -257,17 +200,25 @@ def evaluate(checkpoint="best_model.pth"):
         for atype in np.unique(atypes):
             mask = atypes == atype
             n = mask.sum()
-            at_scores = ad[mask]
-            at_pred = (ad > threshold).astype(int)[mask]
-            at_pr_auc = average_precision_score(np.ones(n), at_scores) if n > 0 else 0
-            at_f1 = f1_score(np.ones(n), at_pred) if n > 0 else 0
-            at_rec = recall_score(np.ones(n), at_pred) if n > 0 else 0
+            at_true = np.concatenate([np.zeros(len(ne)), np.ones(n)])
+            at_scores = np.concatenate([ne, ae[mask]])
+            at_preds = np.concatenate([
+                (ne > threshold).astype(int),
+                (ae > threshold).astype(int)[mask],
+            ])
+            at_pr_auc = average_precision_score(at_true, at_scores) if n > 0 else 0
+            at_f1 = f1_score(at_true, at_preds) if n > 0 else 0
+            at_rec = recall_score(at_true, at_preds) if n > 0 else 0
             print(f"{atype:<20s} {at_pr_auc:>8.4f} {at_f1:>8.4f} {at_rec:>8.4f} {n:>8,}")
 
         all_results[test_name] = {
             "accuracy": acc, "precision": prec, "recall": rec,
             "f1": f1, "pr_auc": pr_auc,
         }
+
+        plot_error_distribution(ne, ae, threshold, tag=test_name)
+        plot_pr_curve(y_true, y_scores, pr_auc, tag=test_name)
+        plot_confusion_matrix(y_true, y_pred, tag=test_name)
 
     print(f"\n{'='*60}")
     print(f"  SUMMARY (all test sets)")

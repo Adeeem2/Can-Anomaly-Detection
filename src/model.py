@@ -18,16 +18,16 @@ class Autoencoder(nn.Module):
         total_dim = embedding_dim + payload_dim
 
         self.encoder = nn.Sequential(
-            nn.Linear(total_dim, 16),
+            nn.Linear(total_dim, 8),
             nn.ReLU(),
-            nn.Linear(16, 8),
+            nn.Linear(8, 4),
             nn.ReLU(),
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(8, 16),
+            nn.Linear(4, 8),
             nn.ReLU(),
-            nn.Linear(16, total_dim),
+            nn.Linear(8, total_dim),
             nn.Sigmoid()
         )
 
