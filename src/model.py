@@ -28,7 +28,8 @@ class Autoencoder(nn.Module):
             nn.Linear(4, 8),
             nn.ReLU(),
             nn.Linear(8, total_dim),
-            nn.Sigmoid()
+            nn.Tanh()
+
         )
 
     def forward(self, id_idx, payload):
