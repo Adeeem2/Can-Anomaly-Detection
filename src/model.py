@@ -4,21 +4,22 @@ import torch.nn.functional as F
 
 
 class Autoencoder(nn.Module):
-    """Dense autoencoder with learned CAN ID embedding for anomaly detection.
+    """Dense autoencoder over per-frame feature vectors (no CAN ID embedding).
 
     Architecture:
-        CAN ID (int index 0-30) ──→ Embedding(31, 6) ──┐
-                                                         ├── concat(6+9=15) → Encoder → Bottleneck(8) → Decoder → 15
-        Payload (8 bytes + DLC) ────────────────────────┘
+        Input (13: 4 ID-behavioral stats + 8 bytes + DLC)
+            -> Linear(13, 8) -> ReLU
+            -> Linear(8, 4) -> ReLU      (bottleneck)
+            -> Linear(4, 8) -> ReLU
+            -> Linear(8, 13) -> Tanh
     """
 
-    def __init__(self, num_ids=31, embedding_dim=6, payload_dim=9):
+    def __init__(self, input_dim=13):
         super().__init__()
-        self.id_embedding = nn.Embedding(num_ids, embedding_dim)
-        total_dim = embedding_dim + payload_dim
+        self.input_dim = input_dim
 
         self.encoder = nn.Sequential(
-            nn.Linear(total_dim, 8),
+            nn.Linear(input_dim, 8),
             nn.ReLU(),
             nn.Linear(8, 4),
             nn.ReLU(),
@@ -27,23 +28,16 @@ class Autoencoder(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(4, 8),
             nn.ReLU(),
-            nn.Linear(8, total_dim),
-            nn.Tanh()
-
+            nn.Linear(8, input_dim),
+            nn.Tanh(),
         )
 
-    def forward(self, id_idx, payload):
-        id_emb = self.id_embedding(id_idx)
-        x = torch.cat([id_emb, payload], dim=1)
+    def forward(self, x):
         return self.decoder(self.encoder(x))
 
     @torch.no_grad()
-    def get_reconstruction_error(self, id_idx, payload):
+    def get_reconstruction_error(self, x):
         self.eval()
-        id_emb = self.id_embedding(id_idx)
-        x = torch.cat([id_emb, payload], dim=1)
-        recon = self.forward(id_idx, payload)
-        mse = F.mse_loss(recon, x, reduction='none').mean(dim=1)
+        recon = self.forward(x)
+        mse = F.mse_loss(recon, x, reduction="none").mean(dim=1)
         return mse
-
-

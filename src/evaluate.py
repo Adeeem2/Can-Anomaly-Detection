@@ -11,13 +11,15 @@ from sklearn.metrics import (
 )
 
 from src.model import Autoencoder
-from src.train import can_ids_to_indices, BYTE_COLS, TOP_K
+from src.features import load_id_stats, build_features, BYTE_COLS
 
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
 MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 FIG_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\figures")
 FIG_DIR.mkdir(exist_ok=True)
+
+INPUT_DIM = 13
 
 
 def load_model(checkpoint="best_model.pth", device=None):
@@ -27,11 +29,7 @@ def load_model(checkpoint="best_model.pth", device=None):
     ckpt = torch.load(MODEL_DIR / checkpoint, map_location=device, weights_only=False)
     threshold = ckpt.get("threshold", None)
 
-    with open(DATA_DIR / "top_can_ids.json") as f:
-        top_ids = json.load(f)
-    num_ids = len(top_ids) + 1
-
-    model = Autoencoder(num_ids=num_ids).to(device)
+    model = Autoencoder(input_dim=INPUT_DIM).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
@@ -43,20 +41,20 @@ def load_model(checkpoint="best_model.pth", device=None):
     return model, device, threshold
 
 
-def get_reconstruction_errors(model, id_indices, payload, device, batch_size=256):
+def get_reconstruction_errors(model, features, device, batch_size=256):
     model.eval()
     all_errs = []
     with torch.no_grad():
-        for i in range(0, len(id_indices), batch_size):
-            idx_batch = torch.tensor(id_indices[i:i+batch_size], dtype=torch.long).to(device)
-            pay_batch = torch.tensor(payload[i:i+batch_size], dtype=torch.float32).to(device)
-            err = model.get_reconstruction_error(idx_batch, pay_batch)
+        for i in range(0, len(features), batch_size):
+            feats_batch = torch.tensor(features[i:i+batch_size], dtype=torch.float32).to(device)
+            err = model.get_reconstruction_error(feats_batch)
             all_errs.append(err.cpu().numpy())
     return np.concatenate(all_errs)
 
-def detect(model, n_id_idx, n_payload, a_id_idx, a_payload, device, threshold):
-    normal_errs = get_reconstruction_errors(model, n_id_idx, n_payload, device)
-    attack_errs = get_reconstruction_errors(model, a_id_idx, a_payload, device)
+
+def detect(model, n_feats, a_feats, device, threshold):
+    normal_errs = get_reconstruction_errors(model, n_feats, device)
+    attack_errs = get_reconstruction_errors(model, a_feats, device)
 
     print(f"Threshold: {threshold:.6f}")
     print(f"  Normal reconstruction error: mean={normal_errs.mean():.6f} std={normal_errs.std():.6f}")
@@ -142,26 +140,25 @@ def plot_confusion_matrix(y_true, y_pred, tag=""):
 #  Main evaluation
 # ──────────────────────────────────────────────
 
-def load_test_csv(csv_path, top_ids):
-    """Load a parsed test CSV and return 9-dim payload + CAN ID indices."""
+def load_test_csv(csv_path, stats, global_avg):
+    """Load a parsed test CSV and return 13-dim feature matrices."""
     df = pd.read_csv(csv_path)
     n_mask = df["attack"].values == 0
     a_mask = df["attack"].values == 1
 
     def extract(id_mask):
         ids = df.loc[id_mask, "CAN_ID"].astype(str).values
-        id_idx = can_ids_to_indices(ids, top_ids)
         payload = np.hstack([
             df.loc[id_mask, BYTE_COLS].values.astype(np.float32),
             df.loc[id_mask, "DLC"].values.astype(np.float32).reshape(-1, 1),
         ]).astype(np.float32)
-        return id_idx, payload
+        return build_features(ids, payload, stats, global_avg)
 
-    n_id_idx, n_payload = extract(n_mask)
-    a_id_idx, a_payload = extract(a_mask)
+    n_feats = extract(n_mask)
+    a_feats = extract(a_mask)
     a_types = df.loc[a_mask, "attack_type"].values.astype(str)
-    print(f"  Normal={len(n_payload):,} | Attack={len(a_payload):,} | Types: {np.unique(a_types)}")
-    return n_id_idx, n_payload, a_id_idx, a_payload, a_types
+    print(f"  Normal={len(n_feats):,} | Attack={len(a_feats):,} | Types: {np.unique(a_types)}")
+    return n_feats, a_feats, a_types
 
 
 def evaluate(checkpoint="best_model.pth"):
@@ -169,8 +166,7 @@ def evaluate(checkpoint="best_model.pth"):
     if threshold is None:
         raise ValueError("No threshold found in checkpoint.")
 
-    with open(DATA_DIR / "top_can_ids.json") as f:
-        top_ids = json.load(f)
+    stats, global_avg = load_id_stats()
 
     test_csvs = sorted(DATA_DIR.glob("set01_test_*_frames.csv"))
     if not test_csvs:
@@ -182,8 +178,8 @@ def evaluate(checkpoint="best_model.pth"):
         print(f"\n{'='*60}")
         print(f"Test set: {test_name}")
         print(f"{'='*60}")
-        n_id_idx, n_payload, a_id_idx, a_payload, atypes = load_test_csv(csv_path, top_ids)
-        y_true, y_pred, y_scores, ne, ae = detect(model, n_id_idx, n_payload, a_id_idx, a_payload, device, threshold)
+        n_feats, a_feats, atypes = load_test_csv(csv_path, stats, global_avg)
+        y_true, y_pred, y_scores, ne, ae = detect(model, n_feats, a_feats, device, threshold)
 
         acc = accuracy_score(y_true, y_pred)
         prec = precision_score(y_true, y_pred)

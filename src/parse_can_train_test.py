@@ -76,7 +76,7 @@ def process_set_csvs(set_dir, output_name):
 
 
 if __name__ == "__main__":
-    base = CANTT_DIR / "set_01"
-    process_set_csvs(base / "train_01", "set01_train_frames.csv")
+    base = CANTT_DIR / "set_02"
+    process_set_csvs(base / "train_01", "set02_train_frames.csv")
     for test_dir in sorted(base.glob("test_*")):
-        process_set_csvs(test_dir, f"set01_{test_dir.name}_frames.csv")
+        process_set_csvs(test_dir, f"set02_{test_dir.name}_frames.csv")
