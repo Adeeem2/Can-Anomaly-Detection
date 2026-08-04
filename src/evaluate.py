@@ -176,13 +176,13 @@ def evaluate(checkpoint="best_model.pth"):
 
     stats, global_avg = load_id_stats()
 
-    test_csvs = sorted(DATA_DIR.glob("set01_test_*_frames.csv"))
+    test_csvs = sorted(DATA_DIR.glob("set_01_test_*_frames.csv"))
     if not test_csvs:
         raise FileNotFoundError("No test CSVs found in data/. Run parse_can_train_test.py first.")
 
     all_results = {}
     for csv_path in test_csvs:
-        test_name = csv_path.stem.replace("set01_", "").replace("_frames", "")
+        test_name = csv_path.stem.replace("_frames", "")
         print(f"\n{'='*60}")
         print(f"Test set: {test_name}")
         print(f"{'='*60}")

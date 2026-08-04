@@ -73,7 +73,7 @@ def prepare_data(val_ratio=0.2):
                 print(f"  train: {len(d['train_id_idx']):,}  val: {len(d['val_id_idx']):,}  feat_dim={d['train_feats'].shape[1]}")
                 return splits, top_ids
 
-    df = pd.read_csv(DATA_DIR / "set01_train_frames.csv")
+    df = pd.read_csv(DATA_DIR / "all_train_frames.csv")
 
     n_mask = df["attack"].values == 0
     n_df = df.loc[n_mask].copy()
