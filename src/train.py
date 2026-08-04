@@ -30,6 +30,11 @@ def fit_top_ids(can_ids, k=TOP_K):
     return top
 
 
+def can_ids_to_indices(can_ids, top_ids):
+    id_map = {cid: i for i, cid in enumerate(top_ids)}
+    return np.array([id_map.get(cid, TOP_K) for cid in can_ids], dtype=np.int32)
+
+
 def chronological_split(n, val_ratio=0.2):
     n_val = int(n * val_ratio)
     n_train = n - n_val
@@ -41,14 +46,15 @@ def chronological_split(n, val_ratio=0.2):
 # ── Dataset ──────────────────────────────────
 
 class AEMDataset(Dataset):
-    def __init__(self, features):
+    def __init__(self, id_indices, features):
+        self.id_indices = torch.tensor(id_indices, dtype=torch.long)
         self.features = torch.tensor(features, dtype=torch.float32)
 
     def __len__(self):
-        return len(self.features)
+        return len(self.id_indices)
 
     def __getitem__(self, idx):
-        return self.features[idx]
+        return self.id_indices[idx], self.features[idx]
 
 
 # ── Data loading ─────────────────────────────
@@ -57,14 +63,14 @@ def prepare_data(val_ratio=0.2):
     npz_path = DATA_DIR / "ae_data.npz"
     if npz_path.exists():
         with np.load(npz_path, allow_pickle=True) as d:
-            if "train_feats" in d:
+            if "train_feats" in d and "train_id_idx" in d:
                 print("Loading ae_data.npz ...")
                 splits = {
-                    "train": d["train_feats"],
-                    "val":   d["val_feats"],
+                    "train": (d["train_id_idx"], d["train_feats"]),
+                    "val":   (d["val_id_idx"], d["val_feats"]),
                 }
                 top_ids = d["top_ids"].tolist()
-                print(f"  train: {len(d['train_feats']):,}  val: {len(d['val_feats']):,}  feat_dim={d['train_feats'].shape[1]}")
+                print(f"  train: {len(d['train_id_idx']):,}  val: {len(d['val_id_idx']):,}  feat_dim={d['train_feats'].shape[1]}")
                 return splits, top_ids
 
     df = pd.read_csv(DATA_DIR / "set01_train_frames.csv")
@@ -89,19 +95,21 @@ def prepare_data(val_ratio=0.2):
 
     payload = np.hstack([n_bytes, n_dlc.reshape(-1, 1)]).astype(np.float32)
     features = build_features(n_ids, payload, stats, global_avg)
+    id_indices = can_ids_to_indices(n_ids, top_ids)
 
     ni, nv = chronological_split(len(features), val_ratio)
 
     np.savez_compressed(
         npz_path,
-        train_feats=features[ni], val_feats=features[nv],
+        train_id_idx=id_indices[ni], train_feats=features[ni],
+        val_id_idx=id_indices[nv], val_feats=features[nv],
         top_ids=top_ids,
     )
     print(f"Saved ae_data.npz (train={len(ni):,}, val={len(nv):,}, feat_dim={INPUT_DIM})")
 
     splits = {
-        "train": features[ni],
-        "val":   features[nv],
+        "train": (id_indices[ni], features[ni]),
+        "val":   (id_indices[nv], features[nv]),
     }
     return splits, top_ids
 
@@ -112,9 +120,9 @@ def prepare_data(val_ratio=0.2):
 def compute_threshold(model, loader, device, percentile=99):
     model.eval()
     all_errs = []
-    for feats in tqdm(loader, desc="Threshold", leave=False):
-        feats = feats.to(device)
-        err = model.get_reconstruction_error(feats)
+    for id_idx, feats in tqdm(loader, desc="Threshold", leave=False):
+        id_idx, feats = id_idx.to(device), feats.to(device)
+        err = model.get_reconstruction_error(id_idx, feats)
         all_errs.append(err.cpu().numpy())
     all_errs = np.concatenate(all_errs)
     threshold = float(np.percentile(all_errs, percentile))
@@ -131,9 +139,9 @@ def run_epoch(model, loader, device, optimizer=None, desc=None):
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     pbar = tqdm(loader, desc=desc or ("train" if is_train else "val"), leave=False)
     with ctx:
-        for feats in pbar:
-            feats = feats.to(device)
-            recon = model(feats)
+        for id_idx, feats in pbar:
+            id_idx, feats = id_idx.to(device), feats.to(device)
+            recon = model(id_idx, feats)
             loss = torch.nn.functional.mse_loss(recon, feats)
             if is_train:
                 optimizer.zero_grad()
@@ -171,14 +179,15 @@ def train(
     print(f"Device: {device}")
 
     splits, top_ids = prepare_data(val_ratio)
+    top_ids = list(top_ids)
 
     NUM_WORKERS = 2
     loader_kw = dict(batch_size=batch_size, num_workers=NUM_WORKERS, pin_memory=True)
-    train_loader = DataLoader(AEMDataset(splits["train"]), shuffle=True, drop_last=True, **loader_kw)
-    val_loader = DataLoader(AEMDataset(splits["val"]), **loader_kw)
+    train_loader = DataLoader(AEMDataset(*splits["train"]), shuffle=True, drop_last=True, **loader_kw)
+    val_loader = DataLoader(AEMDataset(*splits["val"]), **loader_kw)
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
-    model = Autoencoder(input_dim=INPUT_DIM).to(device)
+    model = Autoencoder(num_ids=len(top_ids) + 1, input_dim=INPUT_DIM).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 

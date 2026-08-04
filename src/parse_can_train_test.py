@@ -7,7 +7,7 @@ Input format (per file): timestamp,arbitration_id,data_field,attack
 Output: combined CSV sorted by timestamp
   - CAN_ID, Timestamp, byte_0..byte_7 (normalized /255),
     DLC (normalized /8), attack (0/1), attack_type (string)
-  - Missing bytes (DLC < 8) filled with -1 before /255 → -0.0039
+  - Missing bytes (DLC < 8) padded with 0x00 before /255 → 0.0
 """
 import pandas as pd
 import numpy as np
@@ -24,7 +24,7 @@ BYTE_COLS = [f"byte_{i}" for i in range(8)]
 def _hex_to_bytes(hex_series):
     """Convert Series of hex strings to (8-column DataFrame, DLC Series).
 
-    Handles empty/missing hex strings (DLC=0, all bytes = -1).
+    Handles empty/missing hex strings (DLC=0, all bytes = 0).
     """
     cleaned = hex_series.fillna("").astype(str).str.strip()
     dlc = (cleaned.str.len() // 2).astype(np.float32)
@@ -38,7 +38,7 @@ def _hex_to_bytes(hex_series):
         byte_df[f"byte_{i}"] = np.where(
             dlc > i,
             ((vals >> shift) & 0xFF).astype(np.float32),
-            -1.0,
+            0.0,
         )
 
     return byte_df, dlc
@@ -76,7 +76,7 @@ def process_set_csvs(set_dir, output_name):
 
 
 if __name__ == "__main__":
-    base = CANTT_DIR / "set_02"
-    process_set_csvs(base / "train_01", "set02_train_frames.csv")
+    base = CANTT_DIR / "set_01"
+    process_set_csvs(base / "train_01", "set01_train_frames.csv")
     for test_dir in sorted(base.glob("test_*")):
-        process_set_csvs(test_dir, f"set02_{test_dir.name}_frames.csv")
+        process_set_csvs(test_dir, f"set01_{test_dir.name}_frames.csv")
