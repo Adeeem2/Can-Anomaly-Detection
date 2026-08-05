@@ -11,8 +11,8 @@ from sklearn.metrics import (
 )
 
 from src.model import Autoencoder
-from src.features import load_id_stats, build_features, BYTE_COLS
-from src.train import can_ids_to_indices, TOP_K
+from src.features import load_id_stats, build_features, compute_temporal_features, BYTE_COLS
+from src.train import can_ids_to_indices
 
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
@@ -20,7 +20,7 @@ MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 FIG_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\figures")
 FIG_DIR.mkdir(exist_ok=True)
 
-INPUT_DIM = 13
+INPUT_DIM = 15
 
 
 def load_model(checkpoint="best_model.pth", device=None):
@@ -147,23 +147,29 @@ def plot_confusion_matrix(y_true, y_pred, tag=""):
 # ──────────────────────────────────────────────
 
 def load_test_csv(csv_path, stats, global_avg, top_ids):
-    """Load a parsed test CSV and return CAN ID indices + 13-dim feature matrices."""
+    """Load a parsed test CSV and return CAN ID indices + 15-dim feature matrices.
+
+    Features are built on the FULL timestamp-sorted stream (normal + attack
+    interleaved) so temporal features measure each frame against its actual
+    predecessor; the normal/attack split happens afterwards.
+    """
     df = pd.read_csv(csv_path)
+    df = df.sort_values("Timestamp").reset_index(drop=True)
+
+    ids = df["CAN_ID"].astype(str).values
+    payload = np.hstack([
+        df[BYTE_COLS].values.astype(np.float32),
+        df["DLC"].values.astype(np.float32).reshape(-1, 1),
+    ]).astype(np.float32)
+    feats = build_features(ids, payload, stats, global_avg)
+    temporal = compute_temporal_features(df, stats, global_avg)
+    feats = np.hstack([feats, temporal]).astype(np.float32)
+    id_idx = can_ids_to_indices(ids, top_ids)
+
     n_mask = df["attack"].values == 0
     a_mask = df["attack"].values == 1
-
-    def extract(id_mask):
-        ids = df.loc[id_mask, "CAN_ID"].astype(str).values
-        id_idx = can_ids_to_indices(ids, top_ids)
-        payload = np.hstack([
-            df.loc[id_mask, BYTE_COLS].values.astype(np.float32),
-            df.loc[id_mask, "DLC"].values.astype(np.float32).reshape(-1, 1),
-        ]).astype(np.float32)
-        feats = build_features(ids, payload, stats, global_avg)
-        return id_idx, feats
-
-    n_id_idx, n_feats = extract(n_mask)
-    a_id_idx, a_feats = extract(a_mask)
+    n_id_idx, n_feats = id_idx[n_mask], feats[n_mask]
+    a_id_idx, a_feats = id_idx[a_mask], feats[a_mask]
     a_types = df.loc[a_mask, "attack_type"].values.astype(str)
     print(f"  Normal={len(n_feats):,} | Attack={len(a_feats):,} | Types: {np.unique(a_types)}")
     return n_id_idx, n_feats, a_id_idx, a_feats, a_types

@@ -7,14 +7,17 @@ from pathlib import Path
 from tqdm import tqdm
 
 from src.model import Autoencoder
-from src.features import fit_id_stats, save_id_stats, build_features, BYTE_COLS
+from src.features import (
+    fit_id_stats, save_id_stats, build_features, compute_temporal_features, BYTE_COLS,
+)
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
 MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-TOP_K = 30
-INPUT_DIM = 13
+TOP_K = 64
+INPUT_DIM = 15
+TRAIN_FRAC = 1.0
 
 
 def set_seed(seed=42):
@@ -32,7 +35,7 @@ def fit_top_ids(can_ids, k=TOP_K):
 
 def can_ids_to_indices(can_ids, top_ids):
     id_map = {cid: i for i, cid in enumerate(top_ids)}
-    return np.array([id_map.get(cid, TOP_K) for cid in can_ids], dtype=np.int32)
+    return np.array([id_map.get(cid, len(top_ids)) for cid in can_ids], dtype=np.int32)
 
 
 def chronological_split(n, val_ratio=0.2):
@@ -59,7 +62,7 @@ class AEMDataset(Dataset):
 
 # ── Data loading ─────────────────────────────
 
-def prepare_data(val_ratio=0.2):
+def prepare_data(val_ratio=0.2, train_frac=TRAIN_FRAC):
     npz_path = DATA_DIR / "ae_data.npz"
     if npz_path.exists():
         with np.load(npz_path, allow_pickle=True) as d:
@@ -73,10 +76,18 @@ def prepare_data(val_ratio=0.2):
                 print(f"  train: {len(d['train_id_idx']):,}  val: {len(d['val_id_idx']):,}  feat_dim={d['train_feats'].shape[1]}")
                 return splits, top_ids
 
-    df = pd.read_csv(DATA_DIR / "all_train_frames.csv")
+    csv_path = DATA_DIR / "set01_train_frames.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"{csv_path} missing. Run parse_can_train_test.py first.")
 
-    n_mask = df["attack"].values == 0
-    n_df = df.loc[n_mask].copy()
+    chunks = []
+    for ch in pd.read_csv(csv_path, chunksize=2_000_000, dtype={"CAN_ID": str}):
+        ch = ch.loc[ch["attack"].values == 0]
+        if train_frac < 1.0:
+            ch = ch.sample(frac=train_frac, random_state=42)
+        chunks.append(ch)
+    n_df = pd.concat(chunks, ignore_index=True)
+
     n_ids = n_df["CAN_ID"].astype(str).values
     n_ts = n_df["Timestamp"].values
     n_bytes = n_df[BYTE_COLS].values.astype(np.float32)
@@ -95,6 +106,8 @@ def prepare_data(val_ratio=0.2):
 
     payload = np.hstack([n_bytes, n_dlc.reshape(-1, 1)]).astype(np.float32)
     features = build_features(n_ids, payload, stats, global_avg)
+    temporal = compute_temporal_features(n_df, stats, global_avg)
+    features = np.hstack([features, temporal]).astype(np.float32)
     id_indices = can_ids_to_indices(n_ids, top_ids)
 
     ni, nv = chronological_split(len(features), val_ratio)
@@ -172,13 +185,14 @@ def train(
     patience=5,
     seed=42,
     threshold_percentile=99,
+    train_frac=TRAIN_FRAC,
     device=None,
 ):
     set_seed(seed)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    splits, top_ids = prepare_data(val_ratio)
+    splits, top_ids = prepare_data(val_ratio, train_frac)
     top_ids = list(top_ids)
 
     NUM_WORKERS = 2

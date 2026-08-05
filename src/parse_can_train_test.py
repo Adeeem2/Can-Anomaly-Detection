@@ -44,26 +44,35 @@ def _hex_to_bytes(hex_series):
     return byte_df, dlc
 
 
+SET_NAMES = ["set_01", "set_02", "set_03", "set_04"]
+
+
+def parse_one_file(csv_path):
+    """Parse a single raw CSV into a per-frame feature DataFrame."""
+    df = pd.read_csv(csv_path, dtype={"attack": np.int8})
+    fname = csv_path.stem
+    atype = fname.rsplit("-", 1)[0]
+    if atype in ("attack-free", "accessory"):
+        atype = "normal"
+
+    byte_df, dlc = _hex_to_bytes(df["data_field"])
+
+    out = pd.DataFrame({
+        "CAN_ID": df["arbitration_id"].astype(str).str.upper(),
+        "Timestamp": df["timestamp"].astype(np.float64),
+        **{c: byte_df[c].values / 255.0 for c in BYTE_COLS},
+        "DLC": dlc.values / 8.0,
+        "attack": df["attack"].values,
+        "attack_type": np.where(df["attack"].values == 1, atype, "normal"),
+    }, index=df.index)
+    return out
+
+
 def process_set_csvs(set_dir, output_name):
     """Process all CSV files in a set directory, output combined sorted CSV."""
     chunks = []
     for csv_path in sorted(set_dir.glob("*.csv")):
-        df = pd.read_csv(csv_path, dtype={"attack": np.int8})
-        fname = csv_path.stem
-        atype = fname.rsplit("-", 1)[0]
-        if atype in ("attack-free", "accessory"):
-            atype = "normal"
-
-        byte_df, dlc = _hex_to_bytes(df["data_field"])
-
-        out = pd.DataFrame({
-            "CAN_ID": df["arbitration_id"].astype(str).str.upper(),
-            "Timestamp": df["timestamp"].astype(np.float64),
-            **{c: byte_df[c].values / 255.0 for c in BYTE_COLS},
-            "DLC": dlc.values / 8.0,
-            "attack": df["attack"].values,
-            "attack_type": np.where(df["attack"].values == 1, atype, "normal"),
-        }, index=df.index)
+        out = parse_one_file(csv_path)
         chunks.append(out)
         print(f"  {csv_path.name}: {len(out):,} rows ({out['attack'].sum():,} attack)")
 
@@ -75,8 +84,23 @@ def process_set_csvs(set_dir, output_name):
           f"{n_attack:,} attack, {len(combined) - n_attack:,} normal)")
 
 
+def merge_train_sets():
+    """Merge train_01 from all 4 sets into data/all_train_frames.csv (no global sort)."""
+    all_chunks = []
+    for set_name in SET_NAMES:
+        train_dir = CANTT_DIR / set_name / "train_01"
+        print(f"\n[{set_name}] train_01:")
+        for csv_path in sorted(train_dir.glob("*.csv")):
+            out = parse_one_file(csv_path)
+            all_chunks.append(out)
+            print(f"  {csv_path.name}: {len(out):,} rows ({out['attack'].sum():,} attack)")
+
+    combined = pd.concat(all_chunks, ignore_index=True)
+    combined.to_csv(OUTPUT_DIR / "all_train_frames.csv", index=False)
+    n_attack = combined["attack"].sum()
+    print(f"\nSaved all_train_frames.csv ({len(combined):,} rows, "
+          f"{n_attack:,} attack, {len(combined) - n_attack:,} normal)")
+
+
 if __name__ == "__main__":
-    base = CANTT_DIR / "set_01"
-    process_set_csvs(base / "train_01", "set01_train_frames.csv")
-    for test_dir in sorted(base.glob("test_*")):
-        process_set_csvs(test_dir, f"set01_{test_dir.name}_frames.csv")
+    merge_train_sets()
