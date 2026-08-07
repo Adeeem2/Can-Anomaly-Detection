@@ -10,7 +10,10 @@ Per-ID behavioral stats (computed once from training-normal data, no leak):
 
 Unseen IDs fall back to the global-average stats across all training IDs.
 Base feature vector per frame = [4 stats, byte_0..7, DLC] -> 13 dims.
-Temporal features [dmean, gap_norm] -> 15 dims total (compute_temporal_features).
+Byte-delta (freeze) features [mean_abs, std] -> 15 dims (ByteDeltaRoller).
+Gap-ratio (timing) features [gap_lo, gap_hi] -> 17 dims (GapRoller +
+normalize_gap_ratios), computed against each ID's training-normal median period,
+so a DoS flood (gap << period) and dropped frames (gap >> period) become OOD.
 """
 import json
 import numpy as np
@@ -22,7 +25,7 @@ BYTE_COLS = [f"byte_{i}" for i in range(8)]
 STAT_NAMES = ["expected_period", "typical_dlc", "payload_variance", "frequency_rank",
               "median_dmean", "median_gap_ms"]
 
-PERIOD_CAP_MS = 1.0
+PERIOD_CAP_MS = 1000.0
 VAR_CAP = 0.3
 GAP_CAP_MS = 10.0
 
@@ -254,3 +257,97 @@ def compute_byte_delta_features(df):
     """Single-pass byte-delta features over a full DataFrame (in-memory equivalent
     of rolling a fresh ``ByteDeltaRoller`` once over ``df``)."""
     return ByteDeltaRoller().advance(df)
+
+
+class GapRoller:
+    """Per-frame inter-arrival gap (ms) vs the previous same-(Session, ID) frame.
+
+    Returns raw ``gap_ms`` as an (N,) array; NaN for the first occurrence of an
+    ID in a session (no predecessor). Normalization against each ID's expected
+    period is done by ``normalize_gap_ratios``.
+
+    Chunk-safe: the last Timestamp per (Session, ID) is carried across chunk
+    boundaries, and gaps are computed WITHIN a session only - the merged CSV
+    interleaves independent recordings (all share the same epoch base), so a
+    global sort must never produce temporal neighbors.
+    """
+
+    def __init__(self):
+        self.last_ts = {}
+
+    def advance(self, df):
+        n = len(df)
+        ids = df["CAN_ID"].astype(str).values
+        ts = df["Timestamp"].values.astype(np.float64)
+
+        if "Session" in df.columns:
+            sess = df["Session"].astype(str).values
+            prev = pd.Series(ts).groupby(
+                [pd.Series(sess), pd.Series(ids)], sort=False
+            ).shift(1).values.astype(np.float64)
+        else:
+            prev = pd.Series(ts).groupby(pd.Series(ids), sort=False).shift(1).values.astype(np.float64)
+        has_prev = ~np.isnan(prev)
+        gap = np.full(n, np.nan, dtype=np.float64)
+        gap[has_prev] = (ts[has_prev] - prev[has_prev]) * 1e3
+
+        # carry the last timestamp per (session, id) across chunk boundaries
+        if "Session" in df.columns:
+            for (s, cid), gi in df.groupby(["Session", "CAN_ID"], sort=False).indices.items():
+                i0 = gi[0]
+                if not has_prev[i0] and (s, cid) in self.last_ts:
+                    gap[i0] = (ts[i0] - self.last_ts[(s, cid)]) * 1e3
+                self.last_ts[(s, cid)] = ts[gi[-1]]
+        else:
+            for cid in pd.unique(ids):
+                idx = np.flatnonzero(ids == cid)
+                if idx.size == 0:
+                    continue
+                i0 = idx[0]
+                if not has_prev[i0] and cid in self.last_ts:
+                    gap[i0] = (ts[i0] - self.last_ts[cid]) * 1e3
+                self.last_ts[cid] = ts[idx[-1]]
+
+        return gap.astype(np.float32)
+
+
+def normalize_gap_ratios(gap_ms, can_ids, stats, global_avg):
+    """Map per-frame gap_ms to [0,1] gap features vs each ID's expected period.
+
+    Expected period = training-normal stat idx 5 (median_gap_ms); unseen IDs fall
+    back to global_avg[5], then 1.0 ms. First frames (gap NaN) -> [1.0, 1.0]
+    (treated as normal: no anomaly evidence yet).
+        gap_lo = min(gap / period, 1)                   -> 1.0 normal, ->0 flood
+        gap_hi = min(period / max(gap, 1e-3), 1)        -> 1.0 normal,
+                 ->0 flood OR long gap (dropped frames)
+    Both are "higher = more normal"; a DoS flood drives both toward 0.
+    """
+    n = len(can_ids)
+    fallback = float(global_avg[5]) if np.isfinite(global_avg[5]) else 1.0
+    if not np.isfinite(fallback) or fallback <= 0:
+        fallback = 1.0
+
+    table = {str(cid): float(v[5]) for cid, v in stats.items()}
+    keys = np.array(sorted(table.keys()), dtype=object)
+    mat = np.array([table[k] for k in keys], dtype=np.float64)
+    query = np.asarray(can_ids, dtype=object)
+    loc = np.clip(np.searchsorted(keys, query), 0, len(keys) - 1)
+    period = mat[loc]
+    period[keys[loc] != query] = fallback
+    period[~np.isfinite(period)] = fallback
+    period[period <= 0] = fallback
+
+    gap = np.asarray(gap_ms, dtype=np.float64)
+    gap_lo = np.minimum(gap / period, 1.0)
+    gap_hi = np.minimum(period / np.maximum(gap, 1e-3), 1.0)
+    gap_lo = np.where(np.isnan(gap_lo), 1.0, gap_lo)
+    gap_hi = np.where(np.isnan(gap_hi), 1.0, gap_hi)
+    return np.column_stack([gap_lo, gap_hi]).astype(np.float32)
+
+
+def compute_gap_ratio_features(df, stats, global_avg):
+    """Single-pass gap features over a full DataFrame (equivalent of rolling a
+    fresh ``GapRoller`` once over ``df``, then normalizing against training stats)."""
+    gap_ms = GapRoller().advance(df)
+    can_ids = df["CAN_ID"].astype(str).values
+    return normalize_gap_ratios(gap_ms, can_ids, stats, global_avg)

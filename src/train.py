@@ -8,7 +8,8 @@ from tqdm import tqdm
 
 from src.model import LSTMAutoencoder
 from src.features import (
-    fit_id_stats, save_id_stats, build_features, ByteDeltaRoller, BYTE_COLS,
+    fit_id_stats, save_id_stats, build_features, ByteDeltaRoller, GapRoller,
+    normalize_gap_ratios, BYTE_COLS,
 )
 
 DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
@@ -16,7 +17,7 @@ MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 MODEL_DIR.mkdir(exist_ok=True)
 
 TOP_K = 64
-INPUT_DIM = 15
+INPUT_DIM = 17
 TRAIN_FRAC = 1.0
 
 WINDOW = 16
@@ -77,7 +78,7 @@ def prepare_data(val_ratio=0.2, train_frac=TRAIN_FRAC, window=WINDOW):
     npz_path = DATA_DIR / "ae_data.npz"
     if npz_path.exists():
         with np.load(npz_path, allow_pickle=True) as d:
-            if d.get("version") == 3 and "train_feats" in d and "train_sess" in d:
+            if d.get("version") == 4 and "train_feats" in d and "train_sess" in d:
                 print("Loading ae_data.npz ...")
                 train_w = make_windows(d["train_feats"], d["train_sess"], window)
                 val_w = make_windows(d["val_feats"], d["val_sess"], window)
@@ -93,8 +94,10 @@ def prepare_data(val_ratio=0.2, train_frac=TRAIN_FRAC, window=WINDOW):
     # Byte-delta features must be computed per-session over the FULL stream (attack
     # frames included) so a replayed payload shows its freeze signal. The merged CSV
     # is grouped by Session and chronological within each session; the roller carries
-    # the last payload per (session, id) across chunk boundaries.
+    # the last payload per (session, id) across chunk boundaries. Raw inter-arrival
+    # gaps (GapRoller) are recorded the same way and normalized after stats are fit.
     roller = ByteDeltaRoller()
+    gap_roller = GapRoller()
     parts = []
     for ch in pd.read_csv(csv_path, chunksize=2_000_000, dtype={"CAN_ID": str}):
         if "Session" in ch.columns:
@@ -102,10 +105,12 @@ def prepare_data(val_ratio=0.2, train_frac=TRAIN_FRAC, window=WINDOW):
         else:
             ch = ch.sort_values("Timestamp").reset_index(drop=True)
         delta = roller.advance(ch)
+        gap_ms = gap_roller.advance(ch)
         m = ch["attack"].values == 0
         keep = ch.loc[m].copy()
         keep["_delta0"] = delta[m, 0]
         keep["_delta1"] = delta[m, 1]
+        keep["_gap_ms"] = gap_ms[m]
         if train_frac < 1.0:
             keep = keep.sample(frac=train_frac, random_state=42)
         parts.append(keep)
@@ -125,7 +130,8 @@ def prepare_data(val_ratio=0.2, train_frac=TRAIN_FRAC, window=WINDOW):
     payload = np.hstack([n_bytes, n_dlc.reshape(-1, 1)]).astype(np.float32)
     features = build_features(n_ids, payload, stats, global_avg)
     temporal = n_df[["_delta0", "_delta1"]].values.astype(np.float32)
-    features = np.hstack([features, temporal]).astype(np.float32)
+    gap_feats = normalize_gap_ratios(n_df["_gap_ms"].values, n_ids, stats, global_avg)
+    features = np.hstack([features, temporal, gap_feats]).astype(np.float32)
 
     if "Session" in n_df.columns:
         sessions = n_df["Session"].astype(str).values
@@ -151,7 +157,7 @@ def prepare_data(val_ratio=0.2, train_frac=TRAIN_FRAC, window=WINDOW):
 
     np.savez_compressed(
         npz_path,
-        version=3,
+        version=4,
         train_feats=train_feats, train_sess=train_sess,
         val_feats=val_feats, val_sess=val_sess,
         top_ids=top_ids,
@@ -178,6 +184,25 @@ def compute_threshold(model, loader, device, percentile=99):
     threshold = float(np.percentile(all_errs, percentile))
     print(f"Threshold ({percentile}th pct): {threshold:.6f}")
     return threshold
+
+
+def compute_timing_threshold(val_w, percentiles=(1, 5)):
+    """Per-window min-gap-ratio thresholds from validation-NORMAL windows only.
+
+    Anomaly = min_ratio BELOW the threshold (flood/gap -> ~0, normal -> ~1), so
+    the timing threshold is the LOW percentile of the normal distribution (p1/p5).
+    min_ratio = min over frames of gap_lo & gap_hi (the last two feature dims),
+    matching the definition used in evaluate.window_stream. No attack/test scores
+    ever enter this calibration.
+    Returns {pct: threshold}.
+    """
+    min_ratio = np.minimum(val_w[..., -2].min(axis=1), val_w[..., -1].min(axis=1))
+    ths = {}
+    for pct in percentiles:
+        th = float(np.percentile(min_ratio, pct))
+        ths[pct] = th
+        print(f"Timing threshold ({pct}th pct of val-normal min-ratio): {th:.6f}")
+    return ths
 
 
 # ── Train / eval one epoch ───────────────────
@@ -214,6 +239,7 @@ def train(
     threshold_percentile=99,
     train_frac=TRAIN_FRAC,
     window=WINDOW,
+    timing_percentiles=(1, 5),
     device=None,
 ):
     set_seed(seed)
@@ -265,6 +291,7 @@ def train(
     print("\nReloading best weights + computing threshold on validation windows ...")
     model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
     threshold = compute_threshold(model, val_loader, device, threshold_percentile)
+    timing_thresholds = compute_timing_threshold(val_w, timing_percentiles)
 
     torch.save({
         "arch": "lstm",
@@ -277,6 +304,8 @@ def train(
         "hidden": LSTM_HIDDEN,
         "num_layers": LSTM_LAYERS,
         "window": WINDOW,
+        "timing_thresholds": {str(p): t for p, t in timing_thresholds.items()},
+        "timing_pcts": list(timing_percentiles),
     }, MODEL_DIR / "best_model_lstm.pth")
 
     pd.DataFrame(history).to_csv(DATA_DIR / "training_history.csv", index=False)

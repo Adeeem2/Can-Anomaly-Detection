@@ -12,7 +12,8 @@ from sklearn.metrics import (
 
 from src.model import Autoencoder, LSTMAutoencoder
 from src.features import (
-    load_id_stats, fit_id_stats, build_features, compute_byte_delta_features, BYTE_COLS,
+    load_id_stats, fit_id_stats, build_features, compute_byte_delta_features,
+    compute_gap_ratio_features, BYTE_COLS,
 )
 from src.train import can_ids_to_indices
 
@@ -22,8 +23,16 @@ MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
 FIG_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\figures")
 FIG_DIR.mkdir(exist_ok=True)
 
-INPUT_DIM = 15
+INPUT_DIM = 17
 LSTM_CKPT = "best_model_lstm.pth"
+
+# Fallback timing threshold used ONLY when a checkpoint lacks val-calibrated
+# "timing_thresholds" (e.g. an old model). It is a domain value, NOT derived from
+# validation data, so a loud warning is printed whenever it is used. The intended
+# source is train.py's compute_timing_threshold (low percentile of the
+# validation-NORMAL per-window min gap-ratio).
+TIMING_FALLBACK = 0.5
+TIMING_PCTS = (1, 5)
 
 
 def _lstm_checkpoints():
@@ -70,6 +79,16 @@ def load_model(checkpoint, device=None):
         num_ids = len(top_ids) + 1
         model = Autoencoder(num_ids=num_ids, input_dim=ckpt.get("input_dim", INPUT_DIM)).to(device)
         meta = {"type": "ae"}
+
+    meta["timing_thresholds"] = None
+    if meta["type"] == "lstm":
+        ths = ckpt.get("timing_thresholds")
+        if isinstance(ths, dict) and ths:
+            meta["timing_thresholds"] = {int(p): float(t) for p, t in ths.items()}
+        else:
+            meta["timing_thresholds"] = {p: TIMING_FALLBACK for p in TIMING_PCTS}
+            print(f"  WARNING: checkpoint has no val-calibrated timing_thresholds; "
+                  f"using domain fallback {TIMING_FALLBACK} (NOT calibrated on validation)")
 
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -138,23 +157,59 @@ def detect_windows(model, norm_windows, att_windows, att_types, device, threshol
     return y_true, y_pred, y_scores, norm_errs, att_errs, att_types
 
 
-def report_per_type(norm_errs, att_errs, att_types, threshold):
-    """PR-AUC / F1 / recall per attack type (each type's attacks vs all normals)."""
-    print(f"\n  {'Type':<22s} {'PR-AUC':>8s} {'F1':>8s} {'Recall':>8s} {'N':>8s}")
-    print(f"  {'-'*56}")
+def report_recon_per_type(norm_errs, att_errs, att_types, threshold):
+    """PRIMARY detector: reconstruction error. Per-type PR-AUC / Precision / Recall
+    / F1 (each type's attacks vs all normals). Threshold = recon threshold from the
+    checkpoint (calibrated on validation-normal windows)."""
+    norm_pred = norm_errs > threshold
+    att_pred = att_errs > threshold
+    print(f"\n  [Reconstruction-based detector (PRIMARY)]")
+    print(f"  Threshold: {threshold:.6f}")
+    print(f"  {'Type':<20s} {'PR-AUC':>8s} {'Precision':>10s} {'Recall':>8s} {'F1':>8s} {'N':>8s}")
+    print(f"  {'-'*64}")
     for atype in np.unique(att_types):
         mask = att_types == atype
         n = int(mask.sum())
         at_true = np.concatenate([np.zeros(len(norm_errs)), np.ones(n)])
         at_scores = np.concatenate([norm_errs, att_errs[mask]])
-        at_preds = np.concatenate([
-            (norm_errs > threshold).astype(int),
-            (att_errs > threshold).astype(int)[mask],
-        ])
+        at_preds = np.concatenate([norm_pred, att_pred[mask]])
         at_pr_auc = average_precision_score(at_true, at_scores) if n else 0.0
-        at_f1 = f1_score(at_true, at_preds) if n else 0.0
+        at_prec = precision_score(at_true, at_preds) if n else 0.0
         at_rec = recall_score(at_true, at_preds) if n else 0.0
-        print(f"  {atype:<22s} {at_pr_auc:>8.4f} {at_f1:>8.4f} {at_rec:>8.4f} {n:>8,}")
+        at_f1 = f1_score(at_true, at_preds) if n else 0.0
+        print(f"  {atype:<20s} {at_pr_auc:>8.4f} {at_prec:>10.4f} {at_rec:>8.4f} {at_f1:>8.4f} {n:>8,}")
+
+
+def report_timing_per_type(norm_ratio, att_ratio, att_types, timing_thresholds):
+    """SUPPLEMENTARY timing heuristic. A window is flagged if its min gap-ratio
+    (min over frames of gap_lo & gap_hi) is BELOW the threshold, which is the LOW
+    percentile of the validation-NORMAL min-ratio distribution (p1/p5). Per-type
+    Precision/Recall/F1 at each threshold (each type's attacks vs all normals)."""
+    print(f"\n  [Timing heuristic (SUPPLEMENTARY) - thresholds calibrated on "
+          f"validation-normal windows only]")
+    label = " | ".join(f"p{p} = {t:.4f}" for p, t in sorted(timing_thresholds.items()))
+    print(f"  Thresholds: {label}")
+    norm_rule = {p: norm_ratio < t for p, t in timing_thresholds.items()}
+    att_rule = {p: att_ratio < t for p, t in timing_thresholds.items()}
+    print(f"  {'Type':<20s} {'Prec(p1)':>9s} {'Rec(p1)':>8s} {'F1(p1)':>8s} "
+          f"{'Prec(p5)':>9s} {'Rec(p5)':>8s} {'F1(p5)':>8s} {'N':>8s}")
+    print(f"  {'-'*80}")
+    for atype in np.unique(att_types):
+        mask = att_types == atype
+        n = int(mask.sum())
+        at_true = np.concatenate([np.zeros(len(norm_ratio)), np.ones(n)])
+        cells = []
+        for p in sorted(timing_thresholds):
+            preds = np.concatenate([norm_rule[p], att_rule[p][mask]])
+            if n == 0:
+                cells += [0.0, 0.0, 0.0]
+                continue
+            cells += [
+                precision_score(at_true, preds),
+                recall_score(at_true, preds),
+                f1_score(at_true, preds),
+            ]
+        print(f"  {atype:<20s} " + " ".join(f"{v:>9.4f}" for v in cells) + f" {n:>8,}")
 
 
 def window_stream(feats, att_mask, sessions, window, a_types=None):
@@ -261,7 +316,7 @@ def plot_confusion_matrix(y_true, y_pred, tag=""):
 # ──────────────────────────────────────────────
 
 def build_full_features(df, stats, global_avg, top_ids):
-    """15-dim features + id indices over the FULL stream.
+    """17-dim features + id indices over the FULL stream.
 
     Frames are grouped by Session (each source file is an independent recording
     sharing the same epoch base), so temporal features never span two sessions.
@@ -277,7 +332,8 @@ def build_full_features(df, stats, global_avg, top_ids):
     ]).astype(np.float32)
     feats = build_features(ids, payload, stats, global_avg)
     delta = compute_byte_delta_features(df)
-    feats = np.hstack([feats, delta]).astype(np.float32)
+    gap = compute_gap_ratio_features(df, stats, global_avg)
+    feats = np.hstack([feats, delta, gap]).astype(np.float32)
     id_idx = can_ids_to_indices(ids, top_ids)
     att_mask = df["attack"].values == 1
     a_types = df.loc[att_mask, "attack_type"].values.astype(str)
@@ -342,12 +398,19 @@ def evaluate(checkpoints=None, models=None):
                 y_true, y_pred, y_scores, ne, ae, att_types = detect_windows(
                     model, norm_w, att_w, aw_types[aw], device, threshold
                 )
+                # Last two feature dims are gap_lo / gap_hi; the window timing
+                # score is the min over frames of both (normal ~1, flood/gap ->0).
+                min_ratio = np.minimum(fw[..., -2].min(axis=1), fw[..., -1].min(axis=1))
+                norm_ratio, att_ratio = min_ratio[~aw], min_ratio[aw]
             else:
                 y_true, y_pred, y_scores, ne, ae, att_types = detect(
                     model, n_id_idx, n_feats, a_id_idx, a_feats, atypes, device, threshold
                 )
+                norm_ratio = att_ratio = None
 
-            report_per_type(ne, ae, att_types, threshold)
+            report_recon_per_type(ne, ae, att_types, threshold)
+            if meta["type"] == "lstm" and meta["timing_thresholds"] is not None:
+                report_timing_per_type(norm_ratio, att_ratio, att_types, meta["timing_thresholds"])
 
             acc = accuracy_score(y_true, y_pred)
             prec = precision_score(y_true, y_pred)
