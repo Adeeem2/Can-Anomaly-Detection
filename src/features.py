@@ -35,7 +35,10 @@ def fit_id_stats(df):
     """Compute per-ID behavioral stats from a normal-only DataFrame.
 
     df: DataFrame with CAN_ID (str), Timestamp, byte_0..byte_7 (normalized /255),
-        DLC (normalized /8). Must be sorted by Timestamp.
+        DLC (normalized /8). When a 'Session' column is present, inter-arrival gaps
+        and byte deltas are computed WITHIN each session only: the merged CSV
+        interleaves independent recordings (all start at the same epoch second),
+        so a global chronological sort must never produce temporal neighbors.
     Returns: stats dict {can_id: [6 floats]} + global_avg list [6 floats].
     """
     df = df.copy()
@@ -52,9 +55,27 @@ def fit_id_stats(df):
         idx = grp_idx.to_numpy()
         g = df.loc[idx]
 
-        ts = ts_arr[idx]
-        gaps = np.diff(ts)
-        gaps = gaps[gaps > 1e-6]
+        gap_parts, dmean_parts = [], []
+        if "Session" in df.columns:
+            for _, sub in g.groupby("Session", sort=False):
+                sub = sub.sort_values("Timestamp")
+                if len(sub) < 2:
+                    continue
+                ts = sub["Timestamp"].values
+                sg = np.diff(ts)
+                sg = sg[sg > 1e-6]
+                gap_parts.append(sg)
+                gb = sub[BYTE_COLS].values
+                dmean_parts.append(np.abs(np.diff(gb, axis=0)).mean(axis=1))
+        else:
+            ts = g["Timestamp"].values
+            sg = np.diff(ts)
+            sg = sg[sg > 1e-6]
+            gap_parts.append(sg)
+            if len(idx) > 1:
+                dmean_parts.append(np.abs(np.diff(byte_arr[idx], axis=0)).mean(axis=1))
+
+        gaps = np.concatenate(gap_parts) if gap_parts else np.array([], dtype=np.float64)
         period = np.median(gaps) * 1e3 if len(gaps) else float("nan")
 
         dlc_mode = g["raw_dlc"].mode().iloc[0]
@@ -70,12 +91,9 @@ def fit_id_stats(df):
 
         rank = np.log1p(counts[cid]) / np.log1p(max_count)
 
-        if len(gb) > 1:
-            median_dmean = float(np.median(np.abs(np.diff(gb, axis=0)).mean(axis=1)))
-            median_gap_ms = float(np.median(gaps) * 1e3) if len(gaps) else float("nan")
-        else:
-            median_dmean = float("nan")
-            median_gap_ms = float("nan")
+        dmeans = np.concatenate(dmean_parts) if dmean_parts else np.array([], dtype=np.float64)
+        median_dmean = float(np.median(dmeans)) if len(dmeans) else float("nan")
+        median_gap_ms = float(np.median(gaps) * 1e3) if len(gaps) else float("nan")
 
         stats[str(cid)] = [
             _normalize_period_ms(period),
@@ -165,3 +183,74 @@ def compute_temporal_features(df, stats, global_avg):
         gap_norm[i[0]] = np.minimum(base_gap / GAP_CAP_MS, 1.0)
 
     return np.column_stack([dmean, gap_norm]).astype(np.float32)
+
+
+class ByteDeltaRoller:
+    """Rolling byte-delta ("freeze signal") features, chunk-safe.
+
+    For each frame, byte delta = current 8 bytes - previous same-ID frame's 8 bytes,
+    computed over the FULL stream (attack frames included) so that a frozen payload
+    (e.g. DoS replay) shows near-zero deltas. When a 'Session' column is present the
+    "previous same-ID frame" is looked up WITHIN the same session only - the merged
+    CSV interleaves independent recordings, so a global sort would compare frames
+    from different sessions and destroy the freeze signal. Summarized over the
+    "real" bytes only (index < raw DLC):
+        byte_delta_mean_abs = mean |delta|
+        byte_delta_std      = std of the 8 deltas
+    First occurrence of an ID in a session (no predecessor) -> [0, 0].
+    """
+
+    def __init__(self):
+        self.last = {}
+
+    def advance(self, df):
+        ids = df["CAN_ID"].astype(str).values
+        b = df[BYTE_COLS].values.astype(np.float32)
+        dlc = (df["DLC"].values * 8).round().astype(np.int64)
+        n = len(df)
+
+        if "Session" in df.columns:
+            sess = df["Session"].astype(str).values
+            prev = pd.DataFrame(b).groupby(
+                [pd.Series(sess), pd.Series(ids)], sort=False
+            ).shift(1).values.astype(np.float32)
+        else:
+            prev = pd.DataFrame(b).groupby(pd.Series(ids), sort=False).shift(1).values.astype(np.float32)
+        is_first = np.isnan(prev).all(axis=1)
+
+        d = np.zeros((n, 8), dtype=np.float32)
+        nz = ~is_first
+        d[nz] = b[nz] - prev[nz]
+
+        # carry the last payload per (session, id) across chunk boundaries
+        if "Session" in df.columns:
+            for (s, cid), gi in df.groupby(["Session", "CAN_ID"], sort=False).indices.items():
+                i0, ilast = gi[0], gi[-1]
+                if is_first[i0] and (s, cid) in self.last:
+                    d[i0] = b[i0] - self.last[(s, cid)]
+                self.last[(s, cid)] = b[ilast]
+        else:
+            for cid in pd.unique(ids):
+                if cid in self.last:
+                    m = (ids == cid) & is_first
+                    if m.any():
+                        d[m] = b[m] - self.last[cid]
+                self.last[cid] = b[ids == cid][-1]
+
+        real = dlc[:, None] > np.arange(8)
+        n_real = real.sum(axis=1)
+        ad = np.where(real, np.abs(d), 0.0)
+        d2 = np.where(real, d, 0.0)
+        mean_abs = ad.sum(axis=1) / np.maximum(n_real, 1)
+        with np.errstate(invalid="ignore"):
+            mean_sq = (d2 * d2).sum(axis=1) / np.maximum(n_real, 1)
+            std = np.sqrt(np.clip(mean_sq - mean_abs ** 2, 0, None))
+        mean_abs = np.where(n_real > 0, mean_abs, 0.0)
+        std = np.where(n_real > 1, std, 0.0)
+        return np.column_stack([mean_abs, std]).astype(np.float32)
+
+
+def compute_byte_delta_features(df):
+    """Single-pass byte-delta features over a full DataFrame (in-memory equivalent
+    of rolling a fresh ``ByteDeltaRoller`` once over ``df``)."""
+    return ByteDeltaRoller().advance(df)

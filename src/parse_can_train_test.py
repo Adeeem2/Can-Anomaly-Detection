@@ -4,9 +4,14 @@ Input format (per file): timestamp,arbitration_id,data_field,attack
   - data_field: hex string (e.g., "3000000430000004")
   - attack: 0 = normal, 1 = attack
 
-Output: combined CSV sorted by timestamp
-  - CAN_ID, Timestamp, byte_0..byte_7 (normalized /255),
+Output: combined CSV sorted by (Session, Timestamp)
+  - CAN_ID, Timestamp, Session, byte_0..byte_7 (normalized /255),
     DLC (normalized /8), attack (0/1), attack_type (string)
+  - Session = the source file stem (e.g. "DoS-1"). Each source file is an
+    independent recording session; ALL sessions share the same epoch base and
+    their timestamp ranges overlap, so a global chronological sort would
+    interleave different sessions. Temporal features (gaps, byte deltas, LSTM
+    windows) must therefore be computed per-session downstream.
   - Missing bytes (DLC < 8) padded with 0x00 before /255 → 0.0
 """
 import pandas as pd
@@ -44,9 +49,6 @@ def _hex_to_bytes(hex_series):
     return byte_df, dlc
 
 
-SET_NAMES = ["set_01", "set_02", "set_03", "set_04"]
-
-
 def parse_one_file(csv_path):
     """Parse a single raw CSV into a per-frame feature DataFrame."""
     df = pd.read_csv(csv_path, dtype={"attack": np.int8})
@@ -60,6 +62,7 @@ def parse_one_file(csv_path):
     out = pd.DataFrame({
         "CAN_ID": df["arbitration_id"].astype(str).str.upper(),
         "Timestamp": df["timestamp"].astype(np.float64),
+        "Session": fname,
         **{c: byte_df[c].values / 255.0 for c in BYTE_COLS},
         "DLC": dlc.values / 8.0,
         "attack": df["attack"].values,
@@ -69,7 +72,12 @@ def parse_one_file(csv_path):
 
 
 def process_set_csvs(set_dir, output_name):
-    """Process all CSV files in a set directory, output combined sorted CSV."""
+    """Process all CSV files in a set directory, output combined sorted CSV.
+
+    Rows are grouped by Session (each source file is an independent recording);
+    within a session they stay in timestamp order. Never global-sort across
+    sessions - every session shares the same epoch base timestamp.
+    """
     chunks = []
     for csv_path in sorted(set_dir.glob("*.csv")):
         out = parse_one_file(csv_path)
@@ -77,30 +85,26 @@ def process_set_csvs(set_dir, output_name):
         print(f"  {csv_path.name}: {len(out):,} rows ({out['attack'].sum():,} attack)")
 
     combined = pd.concat(chunks, ignore_index=True)
-    combined = combined.sort_values("Timestamp").reset_index(drop=True)
+    combined = combined.sort_values(["Session", "Timestamp"]).reset_index(drop=True)
     combined.to_csv(OUTPUT_DIR / output_name, index=False)
     n_attack = combined["attack"].sum()
     print(f"\nSaved {output_name} ({len(combined):,} rows, "
           f"{n_attack:,} attack, {len(combined) - n_attack:,} normal)")
 
 
-def merge_train_sets():
-    """Merge train_01 from all 4 sets into data/all_train_frames.csv (no global sort)."""
-    all_chunks = []
-    for set_name in SET_NAMES:
-        train_dir = CANTT_DIR / set_name / "train_01"
-        print(f"\n[{set_name}] train_01:")
-        for csv_path in sorted(train_dir.glob("*.csv")):
-            out = parse_one_file(csv_path)
-            all_chunks.append(out)
-            print(f"  {csv_path.name}: {len(out):,} rows ({out['attack'].sum():,} attack)")
+def build_set_01():
+    """Build the set_01 pipeline inputs: train frames + per-test frames CSVs.
 
-    combined = pd.concat(all_chunks, ignore_index=True)
-    combined.to_csv(OUTPUT_DIR / "all_train_frames.csv", index=False)
-    n_attack = combined["attack"].sum()
-    print(f"\nSaved all_train_frames.csv ({len(combined):,} rows, "
-          f"{n_attack:,} attack, {len(combined) - n_attack:,} normal)")
+    - train_01 -> data/set01_train_frames.csv (consumed by train.py)
+    - each test dir -> data/set_01_test_*_frames.csv (consumed by evaluate.py)
+    """
+    set_dir = CANTT_DIR / "set_01"
+    process_set_csvs(set_dir / "train_01", "set01_train_frames.csv")
+    for test_dir in sorted(set_dir.glob("test_*")):
+        output_name = f"set_01_{test_dir.name}_frames.csv"
+        print(f"\n[{test_dir.name}]")
+        process_set_csvs(test_dir, output_name)
 
 
 if __name__ == "__main__":
-    merge_train_sets()
+    build_set_01()
