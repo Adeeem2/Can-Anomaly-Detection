@@ -42,6 +42,13 @@ def _lstm_checkpoints():
     )
 
 
+def _ae_checkpoints():
+    """Per-frame AE checkpoints in MODEL_DIR (excludes intermediate *_weights files)."""
+    return sorted(
+        c.name for c in MODEL_DIR.glob("best_model_ae*.pth") if "_weights" not in c.name
+    )
+
+
 def get_stats():
     """Load id_stats.json if present, else recompute from the local train CSV."""
     try:
@@ -354,8 +361,8 @@ def evaluate(checkpoints=None, models=None):
     checkpoints = list(checkpoints or [])
     if "lstm" in models:
         checkpoints += _lstm_checkpoints()
-    if "ae" in models and (MODEL_DIR / AE_CKPT).exists():
-        checkpoints.append(AE_CKPT)
+    if "ae" in models:
+        checkpoints += _ae_checkpoints()
     checkpoints = sorted(set(checkpoints))
     if not checkpoints:
         raise FileNotFoundError(

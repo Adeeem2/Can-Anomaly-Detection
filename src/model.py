@@ -4,20 +4,27 @@ import torch.nn.functional as F
 
 
 class Autoencoder(nn.Module):
-    """Conditional autoencoder: learned CAN ID embedding + ID behavioral stats.
+    """Per-frame feedforward autoencoder - baseline vs the windowed LSTM AE.
+
+    Trained on INDIVIDUAL frames of the 17-dim normalized feature vector
+    (4 ID behavioral stats + 8 payload bytes + DLC + 2 byte-delta + 2
+    gap-ratio, all in [0,1]) with NO temporal context, so its reconstruction
+    error is a pure per-frame anomaly score. The optional learned CAN-ID
+    embedding conditions the encoder/decoder on the ID index (top_can_ids);
+    unseen IDs fall back to the out-of-range embedding class, effectively a
+    plain bottleneck AE for them.
 
     Architecture:
-        CAN ID (int index 0-30) ──→ Embedding(31, 6) ──┐
-                                                          ├── concat(6+13=19) → Encoder → Bottleneck(8)
-        Features (13: 4 stats + 8 bytes + DLC) ──────────┘
-                                                          ↓ latent (8)
-        cat(latent(8), embedding(6)) = 14 → Decoder → 13 → Sigmoid
+        CAN ID (int index 0..num_ids-1) ──→ Embedding ──┐
+                                                           ├── concat(+F=17) → Encoder → Bottleneck(8)
+        Features (17) ──────────────────────────────────┘
+                                                           ↓ latent (8)
+        cat(latent(8), embedding) → Decoder → 17 → Sigmoid
 
-    The embedding is a conditioning input to both encoder and decoder; the
-    decoder reconstructs ONLY the 13-dim features (all in [0,1]) via Sigmoid.
+    The decoder reconstructs ONLY the F features (all in [0,1]) via Sigmoid.
     """
 
-    def __init__(self, num_ids=31, embedding_dim=6, input_dim=13):
+    def __init__(self, num_ids=31, embedding_dim=6, input_dim=17):
         super().__init__()
         self.id_embedding = nn.Embedding(num_ids, embedding_dim)
         total_dim = embedding_dim + input_dim
@@ -58,7 +65,7 @@ class LSTMAutoencoder(nn.Module):
     per-window reconstruction error is the MSE over all W*F values.
     """
 
-    def __init__(self, input_dim=15, hidden=64, num_layers=1):
+    def __init__(self, input_dim=17, hidden=64, num_layers=1):
         super().__init__()
         self.input_dim = input_dim
         self.hidden = hidden
