@@ -265,7 +265,7 @@ Artifacts: `data/` (feature CSVs, id_stats.json, ae_data.npz), `models/` (checkp
 
 ## References
 
-1. Lampe, B., & Meng, W. (2024). *can-train-and-test: A curated CAN dataset for automotive intrusion detection.* Computers & Security, 140, 103777. https://doi.org/10.1016/j.cose.2024.103777
+1. Lampe, B., & Meng, W. (2024). *can-train-and-test: A curated CAN dataset for automotive intrusion detection.* Computers & Security, 140, 103777. https://doi.org/10.1016/j.cose.2024.103777 — dataset: https://bitbucket.org/brooke-lampe/can-train-and-test/src/master/
 2. Hanselmann, M., Strauss, T., Dormann, K., & Ulmer, H. (2020). *CANet: An unsupervised intrusion detection system for high dimensional CAN bus data.* IEEE Access, 8, 58194–58205. https://doi.org/10.1109/ACCESS.2020.2982544
 3. Hossain, M. D., Inoue, H., Ochiai, H., Fall, D., & Kadobayashi, Y. (2020). *LSTM-based intrusion detection system for in-vehicle CAN bus communications.* IEEE Access, 8, 185489–185502. https://doi.org/10.1109/ACCESS.2020.3029307
 4. Moore, M. R., Bridges, R. A., Combs, F. L., Starr, M. S., & Prowell, S. J. (2017). *Modeling inter-signal arrival times for accurate detection of CAN bus signal injection attacks: A data-driven approach to in-vehicle intrusion detection.* Proceedings of the 12th Annual Cyber and Information Security Research Conference (CISRC), ACM. https://doi.org/10.1145/3064814.3064816
