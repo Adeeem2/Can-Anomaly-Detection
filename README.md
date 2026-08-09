@@ -240,6 +240,12 @@ The LSTM at its native granularity (per-window reconstruction), across window si
 6. **Overall takeaway:** the **timing heuristic** is the robust, cheap detector (near-perfect recall on timing attacks, transferable across vehicles); the **per-frame AE** adds learned per-frame sensitivity to payload deviations on the known vehicle but needs threshold recalibration; the **windowed LSTM** contributes only a DoS-specific window-level signal. Unknown-vehicle generalization remains the open problem for every approach.
 7. **Precedent and differentiation:** timing/frequency-based anomaly detection has established precedent in the CAN-IDS literature — notably Moore et al. [4], who model per-signal inter-arrival times to detect injection attacks with reported near-perfect true positive rates on their evaluated scenarios. The gap-ratio heuristic used here follows this same modeling principle (deviation from a learned expected inter-arrival period), applied as a lightweight, honestly-calibrated complement to learned reconstruction-based detectors, and evaluated additionally across a vehicle- and attack-generalization axis not covered in the original work. Caveats on comparability: their 0.9998 TPR / 0.00298 FDR and ~5-second training figures were reported on their own attack scenarios and vehicle, not under the unknown-vehicle / unknown-attack generalization protocol used here; and their timing rule stands alone, whereas ours is one supplementary signal inside a larger pipeline.
 
+## Training results (Kaggle notebook)
+
+Live training run of the windowed LSTM autoencoder on the can-train-and-test training set, including feature engineering, loss curves, and per-epoch validation:
+
+**[CAN Anomaly Detection — LSTM Autoencoder (Kaggle)](https://www.kaggle.com/code/ed4meee/can-anomaly-detection-lstm-autoencoder?scriptVersionId=341038609)**
+
 ## Reproduce
 
 ```bash
