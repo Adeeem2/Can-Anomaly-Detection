@@ -12,8 +12,9 @@ from src.features import (
     normalize_gap_ratios, BYTE_COLS,
 )
 
-DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
-MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+MODEL_DIR = BASE_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 TOP_K = 64

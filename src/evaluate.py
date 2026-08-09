@@ -18,9 +18,10 @@ from src.features import (
 from src.train import can_ids_to_indices
 
 
-DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
-MODEL_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\models")
-FIG_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\figures")
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+MODEL_DIR = BASE_DIR / "models"
+FIG_DIR = BASE_DIR / "figures"
 FIG_DIR.mkdir(exist_ok=True)
 
 INPUT_DIM = 17
@@ -164,13 +165,41 @@ def detect_windows(model, norm_windows, att_windows, att_types, device, threshol
     return y_true, y_pred, y_scores, norm_errs, att_errs, att_types
 
 
-def report_recon_per_type(norm_errs, att_errs, att_types, threshold):
+def get_frame_errors_lstm(model, feats, sessions, window, device, batch_size=256):
+    """Per-frame LSTM score via a causal sliding window (stride 1):
+    score[t] = reconstruction error of the W-frame window ending at t.
+
+    Frames without a full window (the first W-1 frames of each session) get NaN
+    and are excluded downstream. Windows never span two sessions.
+    """
+    model.eval()
+    scores = np.full(len(feats), np.nan, dtype=np.float64)
+    with torch.no_grad():
+        for sess in np.unique(sessions):
+            idx = np.where(sessions == sess)[0]
+            f = feats[idx]
+            n = len(f)
+            if n < window:
+                continue
+            starts = np.arange(0, n - window + 1)
+            for i in range(0, len(starts), batch_size):
+                s = starts[i:i + batch_size]
+                w = np.stack([f[j:j + window] for j in s])
+                w = torch.tensor(w, dtype=torch.float32, device=device)
+                err = model.get_reconstruction_error(w).cpu().numpy()
+                scores[idx[s + window - 1]] = err
+    return scores
+
+
+def report_recon_per_type(norm_errs, att_errs, att_types, threshold, title=None):
     """PRIMARY detector: reconstruction error. Per-type PR-AUC / Precision / Recall
     / F1 (each type's attacks vs all normals). Threshold = recon threshold from the
     checkpoint (calibrated on validation-normal windows)."""
     norm_pred = norm_errs > threshold
     att_pred = att_errs > threshold
     print(f"\n  [Reconstruction-based detector (PRIMARY)]")
+    if title:
+        print(f"  {title}")
     print(f"  Threshold: {threshold:.6f}")
     print(f"  {'Type':<20s} {'PR-AUC':>8s} {'Precision':>10s} {'Recall':>8s} {'F1':>8s} {'N':>8s}")
     print(f"  {'-'*64}")
@@ -409,6 +438,18 @@ def evaluate(checkpoints=None, models=None):
                 # score is the min over frames of both (normal ~1, flood/gap ->0).
                 min_ratio = np.minimum(fw[..., -2].min(axis=1), fw[..., -1].min(axis=1))
                 norm_ratio, att_ratio = min_ratio[~aw], min_ratio[aw]
+
+                # Frame-level LSTM scores via a causal sliding window (stride 1),
+                # so the LSTM can be compared to the per-frame AE on identical
+                # frame-level PR-AUC. Frames without a full window -> NaN, dropped.
+                frame_errs = get_frame_errors_lstm(model, feats, sessions, window, device)
+                valid = ~np.isnan(frame_errs)
+                f_true = att_mask[valid].astype(int)
+                f_scores = frame_errs[valid]
+                f_pred = (f_scores > threshold).astype(int)
+                f_norm = f_scores[f_true == 0]
+                f_att = f_scores[f_true == 1]
+                f_att_types = a_types_full[valid][f_true == 1]
             else:
                 y_true, y_pred, y_scores, ne, ae, att_types = detect(
                     model, n_id_idx, n_feats, a_id_idx, a_feats, atypes, device, threshold
@@ -419,6 +460,12 @@ def evaluate(checkpoints=None, models=None):
             if meta["type"] == "lstm" and meta["timing_thresholds"] is not None:
                 report_timing_per_type(norm_ratio, att_ratio, att_types, meta["timing_thresholds"])
 
+            if meta["type"] == "lstm":
+                report_recon_per_type(
+                    f_norm, f_att, f_att_types, threshold,
+                    title="Frame-level LSTM (causal sliding window)",
+                )
+
             acc = accuracy_score(y_true, y_pred)
             prec = precision_score(y_true, y_pred)
             rec = recall_score(y_true, y_pred)
@@ -428,14 +475,28 @@ def evaluate(checkpoints=None, models=None):
             print(f"  Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f}")
             print(f"  F1: {f1:.4f} | PR-AUC: {pr_auc:.4f}  (primary)")
 
-            plot_error_distribution(ne, ae, threshold, tag=tag)
-            plot_pr_curve(y_true, y_scores, pr_auc, tag=tag)
-            plot_confusion_matrix(y_true, y_pred, tag=tag)
-
             summary[f"{test_name} | {meta['type']}"] = {
                 "accuracy": acc, "precision": prec, "recall": rec,
                 "f1": f1, "pr_auc": pr_auc,
             }
+
+            if meta["type"] == "lstm":
+                f_acc = accuracy_score(f_true, f_pred)
+                f_prec = precision_score(f_true, f_pred)
+                f_rec = recall_score(f_true, f_pred)
+                f_f1 = f1_score(f_true, f_pred)
+                f_pr_auc = average_precision_score(f_true, f_scores)
+                print(f"  Frame-level: Accuracy: {f_acc:.4f} | Precision: {f_prec:.4f} | "
+                      f"Recall: {f_rec:.4f}")
+                print(f"  Frame-level F1: {f_f1:.4f} | PR-AUC: {f_pr_auc:.4f}  (frame-level)")
+                summary[f"{test_name} | lstm_frame"] = {
+                    "accuracy": f_acc, "precision": f_prec, "recall": f_rec,
+                    "f1": f_f1, "pr_auc": f_pr_auc,
+                }
+
+            plot_error_distribution(ne, ae, threshold, tag=tag)
+            plot_pr_curve(y_true, y_scores, pr_auc, tag=tag)
+            plot_confusion_matrix(y_true, y_pred, tag=tag)
 
     print(f"\n{'='*64}")
     print("  SUMMARY")

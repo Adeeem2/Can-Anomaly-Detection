@@ -18,7 +18,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-BASE_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection")
+BASE_DIR = Path(__file__).resolve().parent.parent
 CANTT_DIR = BASE_DIR / "can-train-and-test"
 OUTPUT_DIR = BASE_DIR / "data"
 OUTPUT_DIR.mkdir(exist_ok=True)

@@ -20,7 +20,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-DATA_DIR = Path(r"D:\PROJECT\STAGEKPIT\can-anomaly-detection\data")
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
 BYTE_COLS = [f"byte_{i}" for i in range(8)]
 STAT_NAMES = ["expected_period", "typical_dlc", "payload_variance", "frequency_rank",
               "median_dmean", "median_gap_ms"]
