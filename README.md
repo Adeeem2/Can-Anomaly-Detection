@@ -69,7 +69,7 @@ Two autoencoders are compared. Both are trained **only on normal frames** and sc
 
 **Windowed LSTM AE (`LSTMAutoencoder`)** — processes a window of `W` consecutive frames (`W` = 4/8/16, one window per session). An encoder LSTM (hidden 64, 1 layer) compresses the `(W, 17)` window into a hidden state; the decoder LSTM reconstructs the whole window from that state repeated over `W` steps; the window error is the MSE over all `W × 17` values.
 
-![Per-frame AE (top) and windowed LSTM AE (bottom) architectures](figures/architecture/LSTM+AE architecture.png)
+![Per-frame AE (top) and windowed LSTM AE (bottom) architectures](figures/architecture/LSTM+AE%20architecture.png)
 
 ### Setup
 
