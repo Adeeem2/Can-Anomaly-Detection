@@ -61,6 +61,16 @@ Two detectors are reported per test set, kept as separate tiers:
 
 ## 4. Results
 
+### Model architectures
+
+Two autoencoders are compared. Both are trained **only on normal frames** and score inputs by reconstruction error (MSE), so novel/attack patterns produce larger errors.
+
+**Per-frame feedforward AE (`Autoencoder`)** — scores each frame independently (no temporal context). The 17-dim feature vector is concatenated with a learned 6-dim CAN-ID embedding, compressed by the encoder to an 8-dim bottleneck, then decoded back to 17 dims with the embedding concatenated again; a Sigmoid keeps the reconstruction in `[0,1]`.
+
+**Windowed LSTM AE (`LSTMAutoencoder`)** — processes a window of `W` consecutive frames (`W` = 4/8/16, one window per session). An encoder LSTM (hidden 64, 1 layer) compresses the `(W, 17)` window into a hidden state; the decoder LSTM reconstructs the whole window from that state repeated over `W` steps; the window error is the MSE over all `W × 17` values.
+
+![Per-frame AE (top) and windowed LSTM AE (bottom) architectures](figures/architecture/LSTM+AE architecture.png)
+
 ### Setup
 
 - Models: `LSTMAutoencoder` (encoder LSTM → latent hidden state → decoder LSTM, hidden 64, 1 layer, 17-dim input, non-overlapping per-session windows) and a per-frame `Autoencoder` (per-ID embedding → bottleneck(8) → 17-dim reconstruction, scored frame-by-frame).
